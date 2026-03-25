@@ -1,0 +1,1 @@
+This sound like a great start. Would information also be communicated to each client each round? Otherwise it might be a little too simple. Perhaps you could also add a timer or other features that require a bit more communication. Other than that, it looks like you're on the right track.
