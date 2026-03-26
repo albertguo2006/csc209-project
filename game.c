@@ -120,7 +120,6 @@ int game_add_player(GameState *gs, int fd, const char *name)
             gs->players[i].alive = 1;
             gs->players[i].pending_action_id = -1;
             gs->players[i].pending_target_id = NO_TARGET;
-            gs->players[i].rbuf_len = 0;
             strncpy(gs->players[i].name, name, PLAYER_NAME_LEN - 1);
             gs->players[i].name[PLAYER_NAME_LEN - 1] = '\0';
 
