@@ -24,9 +24,11 @@ typedef enum {
     /* Client -> Server */
     MSG_JOIN          = 0x01,  /* Player sends their name to join */
     MSG_ACTION        = 0x02,  /* Player submits their chosen action */
+    MSG_START_GAME    = 0x03,  /* Host requests game start */
 
     /* Server -> Client */
     MSG_LOBBY_UPDATE  = 0x10,  /* Broadcast: current lobby state */
+    MSG_JOIN_ACK      = 0x19,  /* Unicast: confirm join, tell client their id + host status */
     MSG_GAME_START    = 0x11,  /* Broadcast: game is starting, send roster + action list */
     MSG_ROUND_START   = 0x12,  /* Broadcast: new round, current HP snapshot */
     MSG_TIMER_TICK    = 0x13,  /* Broadcast: seconds remaining in round */
@@ -115,7 +117,8 @@ typedef struct {
 typedef struct {
     uint8_t    msg_type;            /* MSG_LOBBY_UPDATE */
     uint8_t    player_count;
-    uint8_t    padding[2];
+    uint8_t    host_id;             /* player_id of the host */
+    uint8_t    padding;
     PlayerInfo players[MAX_PLAYERS];
 } LobbyUpdateMsg;
 
@@ -238,5 +241,31 @@ typedef struct {
     uint8_t msg_type;               /* MSG_WAIT */
     uint8_t padding[3];
 } WaitMsg;
+
+/*
+ * MSG_JOIN_ACK
+ * Direction : Server -> one client (unicast)
+ * Encoding  : Fixed-width struct, single write()
+ * Semantics : Sent right after a successful MSG_JOIN. Tells the client
+ *             their assigned slot id and whether they are the host.
+ */
+typedef struct {
+    uint8_t msg_type;               /* MSG_JOIN_ACK */
+    uint8_t your_id;
+    uint8_t is_host;
+    uint8_t padding;
+} JoinAckMsg;
+
+/*
+ * MSG_START_GAME
+ * Direction : Client -> Server
+ * Encoding  : Fixed-width struct, single write()
+ * Semantics : Sent by the host to start the game. Server rejects if sender
+ *             is not the host or if fewer than MIN_PLAYERS are in the lobby.
+ */
+typedef struct {
+    uint8_t msg_type;               /* MSG_START_GAME */
+    uint8_t padding[3];
+} StartGameMsg;
 
 #endif /* PROTOCOL_H */

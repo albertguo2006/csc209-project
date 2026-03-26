@@ -45,6 +45,7 @@ typedef struct {
     GamePhase phase;
     int       round_num;
     int       timer_secs_left;
+    int       host_id;              /* player_id of the host (-1 = none yet) */
 
     /* Action table (data-driven, extensible) */
     ActionDef action_defs[MAX_ACTIONS];

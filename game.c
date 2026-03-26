@@ -75,6 +75,7 @@ void game_init(GameState *gs)
     gs->phase      = STATE_LOBBY;
     gs->round_num  = 0;
     gs->alive_count = 0;
+    gs->host_id    = -1;
 
     /* --- Define the MVP action table --- */
     int n = 0;

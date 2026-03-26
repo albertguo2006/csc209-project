@@ -36,6 +36,13 @@ static int write_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
+/* File-scope timer so helper functions can reset it when the game starts */
+static time_t last_tick = 0;
+
+/* Forward declarations */
+static void send_game_start(GameState *gs);
+static void begin_round(GameState *gs);
+
 /* =========================================================================
  * Broadcast helpers
  * ========================================================================= */
@@ -57,6 +64,7 @@ static void send_lobby_update(GameState *gs)
     memset(&m, 0, sizeof(m));
     m.msg_type     = MSG_LOBBY_UPDATE;
     m.player_count = (uint8_t)gs->player_count;
+    m.host_id      = (gs->host_id >= 0) ? (uint8_t)gs->host_id : 0xFF;
     for (int i = 0; i < MAX_PLAYERS; i++) {
         m.players[i].player_id = gs->players[i].id;
         m.players[i].hp        = (uint8_t)gs->players[i].hp;
@@ -179,6 +187,16 @@ static void send_wait(int fd)
     write_all(fd, &m, sizeof(m));
 }
 
+static void send_join_ack(int fd, int your_id, int is_host)
+{
+    JoinAckMsg m;
+    m.msg_type = MSG_JOIN_ACK;
+    m.your_id  = (uint8_t)your_id;
+    m.is_host  = (uint8_t)is_host;
+    m.padding  = 0;
+    write_all(fd, &m, sizeof(m));
+}
+
 /* =========================================================================
  * Disconnect a player cleanly
  * ========================================================================= */
@@ -234,7 +252,15 @@ static void handle_join(GameState *gs, int fd, const JoinMsg *msg)
         close(fd);
         return;
     }
-    printf("[server] Player %d joined: %s\n", id, name);
+
+    /* First player to join becomes the host */
+    if (gs->host_id < 0) {
+        gs->host_id = id;
+    }
+
+    printf("[server] Player %d joined: %s%s\n", id, name,
+           id == gs->host_id ? " (host)" : "");
+    send_join_ack(fd, id, id == gs->host_id);
     send_lobby_update(gs);
 }
 
@@ -281,6 +307,38 @@ static void handle_action(GameState *gs, int player_id, const ActionMsg *msg)
 }
 
 /* =========================================================================
+ * Handle an incoming MSG_START_GAME (host only)
+ * ========================================================================= */
+
+static void handle_start_game(GameState *gs, int player_id)
+{
+    if (player_id != gs->host_id) {
+        send_error(gs->players[player_id].fd, "Only the host can start the game.");
+        return;
+    }
+    if (gs->phase != STATE_LOBBY) {
+        send_error(gs->players[player_id].fd, "Game already started.");
+        return;
+    }
+
+    /* Count named (ready) players */
+    int ready = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (gs->players[i].fd != -1 && gs->players[i].name[0] != '\0')
+            ready++;
+    }
+    if (ready < MIN_PLAYERS) {
+        send_error(gs->players[player_id].fd, "Need at least 2 players to start.");
+        return;
+    }
+
+    printf("[server] Host started the game with %d players.\n", ready);
+    send_game_start(gs);
+    begin_round(gs);
+    last_tick = time(NULL);
+}
+
+/* =========================================================================
  * Process buffered bytes for one player, dispatching complete messages
  * ========================================================================= */
 
@@ -293,8 +351,9 @@ static void process_player_buffer(GameState *gs, int player_id)
         size_t  needed = 0;
 
         switch (opcode) {
-            case MSG_JOIN:   needed = sizeof(JoinMsg);   break;
-            case MSG_ACTION: needed = sizeof(ActionMsg); break;
+            case MSG_JOIN:       needed = sizeof(JoinMsg);       break;
+            case MSG_ACTION:     needed = sizeof(ActionMsg);     break;
+            case MSG_START_GAME: needed = sizeof(StartGameMsg);  break;
             default:
                 /* Unknown opcode — drop connection */
                 fprintf(stderr, "[server] Unknown opcode 0x%02x from player %d\n",
@@ -314,6 +373,9 @@ static void process_player_buffer(GameState *gs, int player_id)
                 break;
             case MSG_ACTION:
                 handle_action(gs, player_id, (const ActionMsg *)p->rbuf);
+                break;
+            case MSG_START_GAME:
+                handle_start_game(gs, player_id);
                 break;
         }
 
@@ -401,9 +463,6 @@ int main(void)
 
     GameState gs;
     game_init(&gs);
-
-    /* Track the last time we sent a timer tick */
-    time_t last_tick = 0;
 
     for (;;) {
         fd_set rfds;
@@ -508,30 +567,7 @@ int main(void)
             if (gs.players[i].fd == -1) continue; /* was disconnected */
         }
 
-        /* --- Auto-start game when minimum players ready --- */
-        if (gs.phase == STATE_LOBBY && gs.player_count >= MIN_PLAYERS) {
-            /* Check all slots have sent MSG_JOIN (name non-empty) */
-            int ready_players = 0;
-            for (int i = 0; i < MAX_PLAYERS; i++) {
-                if (gs.players[i].fd != -1 && gs.players[i].name[0] != '\0') {
-                    ready_players++;
-                }
-            }
-            /* Only start if we've had no new connections for a moment —
-             * use a simple heuristic: start when all current slots are named */
-            int unnamed = 0;
-            for (int i = 0; i < MAX_PLAYERS; i++) {
-                if (gs.players[i].fd != -1 && gs.players[i].name[0] == '\0') {
-                    unnamed++;
-                }
-            }
-            if (ready_players >= MIN_PLAYERS && unnamed == 0) {
-                printf("[server] Starting game with %d players.\n", ready_players);
-                send_game_start(&gs);
-                begin_round(&gs);
-                last_tick = time(NULL);
-            }
-        }
+        /* Game is started explicitly by the host via MSG_START_GAME */
 
         /* --- Check if all actions collected (no timer needed) --- */
         if (gs.phase == STATE_ACTION_COLLECTION && game_all_actions_in(&gs)) {

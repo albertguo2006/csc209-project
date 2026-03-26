@@ -30,6 +30,19 @@ static int       rbuf_len = 0;
 /* Set when we've submitted our action and are waiting */
 static int waiting_for_result = 0;
 
+/* Set when the action prompt needs to be shown */
+static int need_prompt = 0;
+
+/* Set when game is over */
+static int game_over = 0;
+
+/* Lobby / host state */
+static int am_host      = 0;   /* 1 if this client is the host */
+static int my_lobby_id  = -1;  /* our slot id, known from JOIN_ACK */
+
+/* Set once prompt_action has printed the timer line above the input line */
+static int timer_line_displayed = 0;
+
 /* =========================================================================
  * Utility
  * ========================================================================= */
@@ -73,10 +86,27 @@ static void on_lobby_update(const LobbyUpdateMsg *m)
            m->player_count, m->player_count == 1 ? "" : "s");
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (m->players[i].name[0] != '\0') {
-            printf("  [%d] %s\n", m->players[i].player_id, m->players[i].name);
+            printf("  [%d] %s", m->players[i].player_id, m->players[i].name);
+            if (m->players[i].player_id == m->host_id) printf(" (host)");
+            if (m->players[i].player_id == (uint8_t)my_lobby_id) printf(" (YOU)");
+            printf("\n");
         }
     }
-    printf("Waiting for more players...\n");
+    if (am_host) {
+        printf("You are the host. Type 'start' and press Enter when everyone has joined.\n");
+    } else {
+        printf("Waiting for the host to start the game...\n");
+    }
+    fflush(stdout);
+}
+
+static void on_join_ack(const JoinAckMsg *m)
+{
+    my_lobby_id = m->your_id;
+    am_host     = m->is_host;
+    if (am_host) {
+        printf("You are the host.\n");
+    }
     fflush(stdout);
 }
 
@@ -110,6 +140,8 @@ static void on_game_start(const GameStartMsg *m)
 static void on_round_start(const RoundStartMsg *m)
 {
     waiting_for_result = 0;
+    need_prompt = 1;
+    timer_line_displayed = 0;
     printf("\n\033[1m--- Round %d ---\033[0m  (timer: %ds)\n", m->round_num, m->timer_secs);
     printf("Current HP:\n");
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -128,13 +160,26 @@ static void on_round_start(const RoundStartMsg *m)
 
 static void on_timer_tick(const TimerTickMsg *m)
 {
-    clear_line();
-    printf("Time remaining: %2ds", m->seconds_left);
+    if (waiting_for_result) {
+        /* No user input to preserve — overwrite current line */
+        clear_line();
+        printf("Time remaining: %2ds | Waiting for other players...", m->seconds_left);
+    } else if (timer_line_displayed) {
+        /* Prompt is showing below — move up, update timer line, restore cursor */
+        printf("\033[s\033[A\r\033[K");
+        printf("Time remaining: %2ds", m->seconds_left);
+        printf("\033[u");
+    } else {
+        /* Prompt not yet shown — just update inline */
+        clear_line();
+        printf("Time remaining: %2ds", m->seconds_left);
+    }
     fflush(stdout);
 }
 
 static void on_round_result(const RoundResultMsg *m)
 {
+    timer_line_displayed = 0;
     printf("\n\n\033[1m=== Round Results ===\033[0m\n");
     for (int i = 0; i < m->result_count; i++) {
         const ActionResult *r = &m->results[i];
@@ -187,6 +232,7 @@ static void on_player_elim(const PlayerElimMsg *m)
 
 static void on_game_over(const GameOverMsg *m)
 {
+    game_over = 1;
     printf("\n\033[1m=== GAME OVER ===\033[0m\n");
     if (m->is_tie) {
         printf("It's a TIE! Multiple players were eliminated simultaneously.\n");
@@ -210,6 +256,7 @@ static void on_error(const ErrorMsg *m)
 static void on_wait(void)
 {
     waiting_for_result = 1;
+    timer_line_displayed = 0;
     printf("\nAction submitted. Waiting for other players...\n");
     fflush(stdout);
 }
@@ -226,6 +273,7 @@ static int process_server_buffer(void)
 
         switch (opcode) {
             case MSG_LOBBY_UPDATE: needed = sizeof(LobbyUpdateMsg);  break;
+            case MSG_JOIN_ACK:     needed = sizeof(JoinAckMsg);      break;
             case MSG_GAME_START:   needed = sizeof(GameStartMsg);    break;
             case MSG_ROUND_START:  needed = sizeof(RoundStartMsg);   break;
             case MSG_TIMER_TICK:   needed = sizeof(TimerTickMsg);    break;
@@ -243,6 +291,7 @@ static int process_server_buffer(void)
 
         switch (opcode) {
             case MSG_LOBBY_UPDATE: on_lobby_update((const LobbyUpdateMsg *)rbuf); break;
+            case MSG_JOIN_ACK:     on_join_ack((const JoinAckMsg *)rbuf);         break;
             case MSG_GAME_START:   on_game_start((const GameStartMsg *)rbuf);     break;
             case MSG_ROUND_START:  on_round_start((const RoundStartMsg *)rbuf);   break;
             case MSG_TIMER_TICK:   on_timer_tick((const TimerTickMsg *)rbuf);     break;
@@ -271,12 +320,18 @@ static void prompt_action(int sockfd)
 
     printf("\nYour turn! Choose an action:\n");
     for (int i = 0; i < action_count; i++) {
-        printf("  %d) %-10s — %s\n",
+        printf("  %d) %-10s — %s",
                actions[i].action_id,
                actions[i].name,
                actions[i].desc);
+        if (actions[i].requires_target) {
+            printf("  [Usage: %d <target_id>]", actions[i].action_id);
+        }
+        printf("\n");
     }
-    printf("> ");
+    /* Timer on its own line, prompt below — timer ticks will update the line above */
+    printf("Time remaining: --s\n> ");
+    timer_line_displayed = 1;
     fflush(stdout);
 }
 
@@ -383,9 +438,6 @@ int main(int argc, char *argv[])
     }
 
     /* Event loop: select on sockfd + stdin */
-    int game_over = 0;
-    int need_prompt = 0;
-
     for (;;) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -410,15 +462,6 @@ int main(int argc, char *argv[])
             }
             rbuf_len += (int)n;
             if (process_server_buffer() < 0) break;
-
-            /* If we just got a round start and aren't waiting, prompt */
-            if (!waiting_for_result && my_id >= 0 && !game_over) {
-                need_prompt = 1;
-            }
-            if (rbuf[0] == MSG_GAME_OVER || game_over) {
-                game_over = 1;
-                need_prompt = 0;
-            }
         }
 
         /* Read from stdin */
@@ -426,6 +469,25 @@ int main(int argc, char *argv[])
             if (my_id >= 0 && !waiting_for_result && !game_over) {
                 handle_stdin(sockfd);
                 need_prompt = 0;
+            } else if (my_id < 0 && am_host) {
+                /* Host in lobby: wait for "start" command */
+                char tmp[128];
+                if (fgets(tmp, sizeof(tmp), stdin) == NULL) break;
+                tmp[strcspn(tmp, "\n")] = '\0';
+                if (strcmp(tmp, "start") == 0 || tmp[0] == '\0') {
+                    StartGameMsg sgm;
+                    sgm.msg_type   = MSG_START_GAME;
+                    sgm.padding[0] = 0;
+                    sgm.padding[1] = 0;
+                    sgm.padding[2] = 0;
+                    if (write_all(sockfd, &sgm, sizeof(sgm)) < 0) {
+                        perror("write");
+                        break;
+                    }
+                } else {
+                    printf("Type 'start' to begin the game.\n");
+                    fflush(stdout);
+                }
             } else {
                 /* Drain stdin */
                 char tmp[128];
