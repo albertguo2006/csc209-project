@@ -111,9 +111,9 @@ int game_add_player(GameState *gs, int fd, const char *name)
 {
     if (gs->player_count >= MAX_PLAYERS) return -1;
 
-    /* Find an empty slot */
+    /* Find the slot pre-assigned this fd on accept */
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (gs->players[i].fd == -1) {
+        if (gs->players[i].fd == fd) {
             gs->players[i].fd    = fd;
             gs->players[i].hp    = STARTING_HP;
             gs->players[i].alive = 1;
