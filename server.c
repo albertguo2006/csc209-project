@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "protocol.h"
@@ -17,31 +18,37 @@
 #define PORT 4242
 #endif
 
-#define MIN_PLAYERS 2
+#define MIN_PLAYERS     2
+#define RESOLVE_DELAY_US 2000000  /* 2.0 seconds between events */
 
 /* =========================================================================
- * Utility: write an entire buffer, returning -1 on failure
+ * Utility: write entire buffer
  * ========================================================================= */
 
 static int write_all(int fd, const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
-    size_t remaining = len;
-    while (remaining > 0) {
-        ssize_t n = write(fd, p, remaining);
+    size_t rem = len;
+    while (rem > 0) {
+        ssize_t n = write(fd, p, rem);
         if (n <= 0) return -1;
-        p         += n;
-        remaining -= (size_t)n;
+        p   += n;
+        rem -= (size_t)n;
     }
     return 0;
 }
 
-/* File-scope timer so helper functions can reset it when the game starts */
-static time_t last_tick = 0;
+/* =========================================================================
+ * Timer / resolve state
+ * ========================================================================= */
+
+static time_t         last_tick = 0;
+static struct timeval  resolve_last_send;
 
 /* Forward declarations */
 static void send_game_start(GameState *gs);
 static void begin_round(GameState *gs);
+static void finish_resolution(GameState *gs);
 
 /* =========================================================================
  * Broadcast helpers
@@ -50,11 +57,25 @@ static void begin_round(GameState *gs);
 static void broadcast(GameState *gs, const void *msg, size_t len)
 {
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (gs->players[i].fd != -1) {
-            if (write_all(gs->players[i].fd, msg, len) < 0) {
-                /* Will be caught on next select() read */
-            }
-        }
+        if (gs->players[i].fd != -1)
+            write_all(gs->players[i].fd, msg, len);
+    }
+}
+
+static void fill_player_info(GameState *gs, PlayerInfo *pinfo)
+{
+    memset(pinfo, 0, sizeof(PlayerInfo) * MAX_PLAYERS);
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        Player *p = &gs->players[i];
+        pinfo[i].player_id = p->id;
+        pinfo[i].hp = (uint8_t)(p->hp < 0 ? 0 : (p->hp > 255 ? 255 : p->hp));
+        pinfo[i].alive = (uint8_t)p->alive;
+        pinfo[i].char_type = (uint8_t)p->char_type;
+        pinfo[i].speed = (uint8_t)game_get_current_speed(p);
+        pinfo[i].max_hp = (uint8_t)(p->max_hp > 255 ? 255 : p->max_hp);
+        pinfo[i].char_id = (p->char_id >= 0) ? (uint8_t)p->char_id : NO_CHARACTER;
+        pinfo[i].padding = 0;
+        strncpy(pinfo[i].name, p->name, PLAYER_NAME_LEN - 1);
     }
 }
 
@@ -65,39 +86,38 @@ static void send_lobby_update(GameState *gs)
     m.msg_type     = MSG_LOBBY_UPDATE;
     m.player_count = (uint8_t)gs->player_count;
     m.host_id      = (gs->host_id >= 0) ? (uint8_t)gs->host_id : 0xFF;
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        m.players[i].player_id = gs->players[i].id;
-        m.players[i].hp        = (uint8_t)gs->players[i].hp;
-        m.players[i].alive     = (uint8_t)gs->players[i].alive;
-        strncpy(m.players[i].name, gs->players[i].name, PLAYER_NAME_LEN - 1);
-    }
+    fill_player_info(gs, m.players);
     broadcast(gs, &m, sizeof(m));
+}
+
+static void send_char_list(GameState *gs, int fd)
+{
+    CharListMsg m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type   = MSG_CHAR_LIST;
+    m.char_count = NUM_CHARACTERS;
+    game_build_char_list(gs, m.chars);
+    write_all(fd, &m, sizeof(m));
 }
 
 static void send_game_start(GameState *gs)
 {
-    /* Send personalised GameStartMsg to each player (your_id differs) */
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (gs->players[i].fd == -1) continue;
+        Player *p = &gs->players[i];
 
         GameStartMsg m;
         memset(&m, 0, sizeof(m));
         m.msg_type     = MSG_GAME_START;
         m.your_id      = (uint8_t)i;
         m.player_count = (uint8_t)gs->player_count;
-        m.action_count = (uint8_t)gs->action_count;
 
-        for (int j = 0; j < MAX_PLAYERS; j++) {
-            m.players[j].player_id = gs->players[j].id;
-            m.players[j].hp        = (uint8_t)gs->players[j].hp;
-            m.players[j].alive     = (uint8_t)gs->players[j].alive;
-            strncpy(m.players[j].name, gs->players[j].name, PLAYER_NAME_LEN - 1);
-        }
-        for (int j = 0; j < gs->action_count; j++) {
-            m.actions[j] = gs->action_defs[j];
-        }
+        int act_count = 0;
+        game_get_char_actions(p->char_id, m.actions, &act_count);
+        m.action_count = (uint8_t)act_count;
 
-        write_all(gs->players[i].fd, &m, sizeof(m));
+        fill_player_info(gs, m.players);
+        write_all(p->fd, &m, sizeof(m));
     }
 }
 
@@ -105,44 +125,40 @@ static void send_round_start(GameState *gs)
 {
     RoundStartMsg m;
     memset(&m, 0, sizeof(m));
-    m.msg_type   = MSG_ROUND_START;
-    m.round_num  = (uint8_t)gs->round_num;
-    m.timer_secs = ROUND_TIMER_SECS;
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        m.players[i].player_id = gs->players[i].id;
-        m.players[i].hp        = (uint8_t)(gs->players[i].hp < 0 ? 0 : gs->players[i].hp);
-        m.players[i].alive     = (uint8_t)gs->players[i].alive;
-        strncpy(m.players[i].name, gs->players[i].name, PLAYER_NAME_LEN - 1);
-    }
+    m.msg_type     = MSG_ROUND_START;
+    m.round_num    = (uint8_t)gs->round_num;
+    m.timer_secs   = ROUND_TIMER_SECS;
+    m.player_count = (uint8_t)gs->player_count;
+    fill_player_info(gs, m.players);
     broadcast(gs, &m, sizeof(m));
 }
 
 static void send_timer_tick(GameState *gs, int seconds_left)
 {
     TimerTickMsg m;
-    m.msg_type    = MSG_TIMER_TICK;
+    m.msg_type     = MSG_TIMER_TICK;
     m.seconds_left = (uint8_t)seconds_left;
-    m.padding[0]  = 0;
-    m.padding[1]  = 0;
+    m.padding[0]   = 0;
+    m.padding[1]   = 0;
     broadcast(gs, &m, sizeof(m));
 }
 
-static void send_round_result(GameState *gs, ActionResult *results, int count)
+static void send_round_event(GameState *gs, const char *text)
 {
-    RoundResultMsg m;
+    RoundEventMsg m;
     memset(&m, 0, sizeof(m));
-    m.msg_type     = MSG_ROUND_RESULT;
-    m.result_count = (uint8_t)count;
-    for (int i = 0; i < count; i++) {
-        m.results[i] = results[i];
-    }
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        m.players[i].player_id = gs->players[i].id;
-        m.players[i].hp        = (uint8_t)(gs->players[i].hp < 0 ? 0 : gs->players[i].hp);
-        m.players[i].alive     = (uint8_t)gs->players[i].alive;
-        strncpy(m.players[i].name, gs->players[i].name, PLAYER_NAME_LEN - 1);
-    }
+    m.msg_type = MSG_ROUND_EVENT;
+    strncpy(m.text, text, EVENT_TEXT_LEN - 1);
     broadcast(gs, &m, sizeof(m));
+}
+
+static void send_status_update(int fd, const char *text)
+{
+    StatusUpdateMsg m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = MSG_STATUS_UPDATE;
+    strncpy(m.text, text, STATUS_TEXT_LEN - 1);
+    write_all(fd, &m, sizeof(m));
 }
 
 static void send_player_elim(GameState *gs, int player_id)
@@ -162,9 +178,8 @@ static void send_game_over(GameState *gs, int is_tie, int winner_id)
     m.msg_type  = MSG_GAME_OVER;
     m.is_tie    = (uint8_t)is_tie;
     m.winner_id = (winner_id >= 0) ? (uint8_t)winner_id : 0xFF;
-    if (winner_id >= 0) {
+    if (winner_id >= 0)
         strncpy(m.winner_name, gs->players[winner_id].name, PLAYER_NAME_LEN - 1);
-    }
     broadcast(gs, &m, sizeof(m));
 }
 
@@ -180,10 +195,8 @@ static void send_error(int fd, const char *msg)
 static void send_wait(int fd)
 {
     WaitMsg m;
-    m.msg_type  = MSG_WAIT;
-    m.padding[0] = 0;
-    m.padding[1] = 0;
-    m.padding[2] = 0;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = MSG_WAIT;
     write_all(fd, &m, sizeof(m));
 }
 
@@ -198,7 +211,7 @@ static void send_join_ack(int fd, int your_id, int is_host)
 }
 
 /* =========================================================================
- * Disconnect a player cleanly
+ * Disconnect a player
  * ========================================================================= */
 
 static void disconnect_player(GameState *gs, int player_id)
@@ -211,28 +224,28 @@ static void disconnect_player(GameState *gs, int player_id)
     p->fd = -1;
 
     if (gs->phase == STATE_LOBBY) {
+        if (p->char_id >= 0 && p->char_id < NUM_CHARACTERS)
+            gs->char_taken[p->char_id] = 0;
         p->alive = 0;
+        p->char_id = -1;
         gs->player_count--;
         gs->alive_count--;
         send_lobby_update(gs);
     } else {
-        /* In-game: treat as elimination */
         int was_alive = p->alive;
         game_remove_player(gs, player_id);
-        if (was_alive) {
+        if (was_alive)
             send_player_elim(gs, player_id);
-        }
     }
 }
 
 /* =========================================================================
- * Handle an incoming MSG_JOIN
+ * Handle MSG_JOIN
  * ========================================================================= */
 
 static void handle_join(GameState *gs, int fd, const JoinMsg *msg)
 {
     if (gs->phase != STATE_LOBBY) {
-        /* Game already started — reject */
         send_error(fd, "Game already in progress.");
         close(fd);
         return;
@@ -241,10 +254,8 @@ static void handle_join(GameState *gs, int fd, const JoinMsg *msg)
     char name[PLAYER_NAME_LEN];
     strncpy(name, msg->name, PLAYER_NAME_LEN - 1);
     name[PLAYER_NAME_LEN - 1] = '\0';
-    /* Strip non-printable chars */
-    for (int i = 0; name[i]; i++) {
+    for (int i = 0; name[i]; i++)
         if (name[i] < 0x20 || name[i] > 0x7E) name[i] = '?';
-    }
 
     int id = game_add_player(gs, fd, name);
     if (id < 0) {
@@ -253,19 +264,48 @@ static void handle_join(GameState *gs, int fd, const JoinMsg *msg)
         return;
     }
 
-    /* First player to join becomes the host */
-    if (gs->host_id < 0) {
-        gs->host_id = id;
-    }
+    if (gs->host_id < 0) gs->host_id = id;
 
     printf("[server] Player %d joined: %s%s\n", id, name,
            id == gs->host_id ? " (host)" : "");
     send_join_ack(fd, id, id == gs->host_id);
+    send_char_list(gs, fd);
     send_lobby_update(gs);
 }
 
 /* =========================================================================
- * Handle an incoming MSG_ACTION
+ * Handle MSG_CHAR_SELECT
+ * ========================================================================= */
+
+static void handle_char_select(GameState *gs, int player_id,
+                               const CharSelectMsg *msg)
+{
+    Player *p = &gs->players[player_id];
+    int cid = msg->char_id;
+
+    if (gs->phase != STATE_LOBBY) {
+        send_error(p->fd, "Can't change character now.");
+        return;
+    }
+
+    if (game_assign_character(gs, player_id, cid) < 0) {
+        send_error(p->fd, "Character unavailable or invalid.");
+        return;
+    }
+
+    printf("[server] Player %d picked character %d (%s)\n",
+           player_id, cid, p->name);
+
+    /* Broadcast updated lobby and send updated char list to all */
+    send_lobby_update(gs);
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (gs->players[i].fd != -1)
+            send_char_list(gs, gs->players[i].fd);
+    }
+}
+
+/* =========================================================================
+ * Handle MSG_ACTION
  * ========================================================================= */
 
 static void handle_action(GameState *gs, int player_id, const ActionMsg *msg)
@@ -282,38 +322,38 @@ static void handle_action(GameState *gs, int player_id, const ActionMsg *msg)
     }
 
     int aid = msg->action_id;
-    if (aid < 0 || aid >= gs->action_count) {
-        send_error(p->fd, "Invalid action ID.");
+    int tid = msg->target_id;
+
+    char err[64];
+    if (game_validate_action(gs, player_id, aid, tid, err, sizeof(err)) < 0) {
+        send_error(p->fd, err);
         return;
     }
 
-    /* Validate target */
-    if (gs->action_defs[aid].requires_target) {
-        int tid = msg->target_id;
-        if (tid == NO_TARGET || tid >= MAX_PLAYERS
-                || !gs->players[tid].alive || tid == player_id) {
-            send_error(p->fd, "Invalid or missing target.");
-            return;
-        }
-        p->pending_target_id = tid;
-    } else {
-        p->pending_target_id = NO_TARGET;
+    int req = 0;
+    if (p->char_id >= 0) {
+        ActionDef actions[MOVES_PER_CHAR];
+        int count = 0;
+        game_get_char_actions(p->char_id, actions, &count);
+        if (aid < count) req = actions[aid].requires_target;
     }
 
     p->pending_action_id = aid;
+    p->pending_target_id = (req > 0) ? tid : NO_TARGET;
+
     send_wait(p->fd);
     printf("[server] Player %d (%s) chose action %d target %d\n",
            player_id, p->name, aid, p->pending_target_id);
 }
 
 /* =========================================================================
- * Handle an incoming MSG_START_GAME (host only)
+ * Handle MSG_START_GAME
  * ========================================================================= */
 
 static void handle_start_game(GameState *gs, int player_id)
 {
     if (player_id != gs->host_id) {
-        send_error(gs->players[player_id].fd, "Only the host can start the game.");
+        send_error(gs->players[player_id].fd, "Only the host can start.");
         return;
     }
     if (gs->phase != STATE_LOBBY) {
@@ -321,14 +361,21 @@ static void handle_start_game(GameState *gs, int player_id)
         return;
     }
 
-    /* Count named (ready) players */
+    /* Check all players have selected characters */
     int ready = 0;
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (gs->players[i].fd != -1 && gs->players[i].name[0] != '\0')
+        if (gs->players[i].fd != -1 && gs->players[i].name[0] != '\0') {
+            if (gs->players[i].char_id < 0) {
+                send_error(gs->players[player_id].fd,
+                           "All players must select a character first.");
+                return;
+            }
             ready++;
+        }
     }
     if (ready < MIN_PLAYERS) {
-        send_error(gs->players[player_id].fd, "Need at least 2 players to start.");
+        send_error(gs->players[player_id].fd,
+                   "Need at least 2 players to start.");
         return;
     }
 
@@ -339,7 +386,7 @@ static void handle_start_game(GameState *gs, int player_id)
 }
 
 /* =========================================================================
- * Process buffered bytes for one player, dispatching complete messages
+ * Process player buffer
  * ========================================================================= */
 
 static void process_player_buffer(GameState *gs, int player_id)
@@ -348,42 +395,40 @@ static void process_player_buffer(GameState *gs, int player_id)
 
     while (p->rbuf_len > 0) {
         uint8_t opcode = p->rbuf[0];
-        size_t  needed = 0;
+        size_t needed = 0;
 
         switch (opcode) {
-            case MSG_JOIN:       needed = sizeof(JoinMsg);       break;
-            case MSG_ACTION:     needed = sizeof(ActionMsg);     break;
-            case MSG_START_GAME: needed = sizeof(StartGameMsg);  break;
-            default:
-                /* Unknown opcode — drop connection */
-                fprintf(stderr, "[server] Unknown opcode 0x%02x from player %d\n",
-                        opcode, player_id);
-                disconnect_player(gs, player_id);
-                return;
+        case MSG_JOIN:        needed = sizeof(JoinMsg);       break;
+        case MSG_ACTION:      needed = sizeof(ActionMsg);     break;
+        case MSG_START_GAME:  needed = sizeof(StartGameMsg);  break;
+        case MSG_CHAR_SELECT: needed = sizeof(CharSelectMsg); break;
+        default:
+            fprintf(stderr, "[server] Unknown opcode 0x%02x from player %d\n",
+                    opcode, player_id);
+            disconnect_player(gs, player_id);
+            return;
         }
 
-        if ((size_t)p->rbuf_len < needed) {
-            break; /* Need more bytes */
-        }
+        if ((size_t)p->rbuf_len < needed) break;
 
-        /* Dispatch */
         switch (opcode) {
-            case MSG_JOIN:
-                handle_join(gs, p->fd, (const JoinMsg *)p->rbuf);
-                break;
-            case MSG_ACTION:
-                handle_action(gs, player_id, (const ActionMsg *)p->rbuf);
-                break;
-            case MSG_START_GAME:
-                handle_start_game(gs, player_id);
-                break;
+        case MSG_JOIN:
+            handle_join(gs, p->fd, (const JoinMsg *)p->rbuf);
+            break;
+        case MSG_ACTION:
+            handle_action(gs, player_id, (const ActionMsg *)p->rbuf);
+            break;
+        case MSG_START_GAME:
+            handle_start_game(gs, player_id);
+            break;
+        case MSG_CHAR_SELECT:
+            handle_char_select(gs, player_id, (const CharSelectMsg *)p->rbuf);
+            break;
         }
 
-        /* Consume the message from the buffer */
         int remaining = p->rbuf_len - (int)needed;
-        if (remaining > 0) {
+        if (remaining > 0)
             memmove(p->rbuf, p->rbuf + needed, (size_t)remaining);
-        }
         p->rbuf_len = remaining;
     }
 }
@@ -395,39 +440,92 @@ static void process_player_buffer(GameState *gs, int player_id)
 static void begin_round(GameState *gs)
 {
     gs->round_num++;
-    gs->phase            = STATE_ACTION_COLLECTION;
-    gs->timer_secs_left  = ROUND_TIMER_SECS;
+
+    /* Tick status effects */
+    char tick_text[EVENT_TEXT_LEN];
+    game_tick_effects(gs, tick_text, sizeof(tick_text));
+
+    /* Send tick events if any */
+    if (tick_text[0] != '\0')
+        send_round_event(gs, tick_text);
+
+    /* Check if anyone died from ticks */
+    int winner_id = -1;
+    int end = game_check_end(gs, &winner_id);
+    if (end != 0) {
+        /* Send eliminations */
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            if (!gs->players[i].alive && gs->players[i].fd != -1
+                && gs->players[i].hp <= 0)
+                send_player_elim(gs, i);
+        }
+        gs->phase = STATE_GAME_OVER;
+        send_game_over(gs, end == 2, winner_id);
+        printf("[server] Game over from ticks. %s\n",
+               end == 2 ? "Tie!" : gs->players[winner_id].name);
+        return;
+    }
+
+    gs->phase = STATE_ACTION_COLLECTION;
+    gs->timer_secs_left = ROUND_TIMER_SECS;
     game_clear_actions(gs);
     printf("[server] --- Round %d ---\n", gs->round_num);
+
     send_round_start(gs);
+
+    /* Send status updates to each alive player */
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        Player *p = &gs->players[i];
+        if (p->alive && p->fd != -1) {
+            char status_text[STATUS_TEXT_LEN];
+            game_build_status_text(gs, i, status_text, sizeof(status_text));
+            send_status_update(p->fd, status_text);
+        }
+    }
 }
 
 /* =========================================================================
- * Resolve round and advance state
+ * Start resolution (enter STATE_RESOLVING)
  * ========================================================================= */
 
-static void resolve_round(GameState *gs)
+static void start_resolution(GameState *gs)
 {
-    gs->phase = STATE_CALCULATION;
+    gs->phase = STATE_RESOLVING;
+    game_resolve_round(gs);
+    gs->resolve_event_current = 0;
+    gettimeofday(&resolve_last_send, NULL);
 
-    ActionResult results[MAX_PLAYERS];
-    int count = game_resolve_round(gs, results, MAX_PLAYERS);
-
-    /* Announce eliminations */
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (gs->players[i].hp <= 0 && !gs->players[i].alive
-                && gs->players[i].fd != -1) {
-            send_player_elim(gs, i);
-        }
+    /* Send first event immediately */
+    if (gs->resolve_event_current < gs->resolve_event_count) {
+        send_round_event(gs, gs->resolve_events[gs->resolve_event_current]);
+        gs->resolve_event_current++;
+        gettimeofday(&resolve_last_send, NULL);
+        printf("[server] Event %d/%d sent\n",
+               gs->resolve_event_current, gs->resolve_event_count);
+    } else {
+        finish_resolution(gs);
     }
+}
 
-    send_round_result(gs, results, count);
+/* =========================================================================
+ * Finish resolution (after all events sent)
+ * ========================================================================= */
+
+static void finish_resolution(GameState *gs)
+{
+    /* Send eliminations */
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (!gs->players[i].alive && gs->players[i].fd != -1
+            && gs->players[i].hp <= 0)
+            send_player_elim(gs, i);
+    }
 
     int winner_id = -1;
     int end = game_check_end(gs, &winner_id);
 
     if (end == 0) {
         begin_round(gs);
+        last_tick = time(NULL);
     } else {
         gs->phase = STATE_GAME_OVER;
         send_game_over(gs, end == 2, winner_id);
@@ -442,6 +540,8 @@ static void resolve_round(GameState *gs)
 
 int main(void)
 {
+    srand((unsigned)time(NULL));
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("socket"); exit(1); }
 
@@ -478,12 +578,24 @@ int main(void)
             }
         }
 
-        /* Use 1-second timeout during action collection for timer ticks */
+        /* Timeout logic */
         struct timeval tv;
         struct timeval *tvp = NULL;
+
         if (gs.phase == STATE_ACTION_COLLECTION) {
             tv.tv_sec  = 1;
             tv.tv_usec = 0;
+            tvp = &tv;
+        } else if (gs.phase == STATE_RESOLVING) {
+            /* Calculate time until next event */
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            long elapsed_us = (now.tv_sec - resolve_last_send.tv_sec) * 1000000L
+                            + (now.tv_usec - resolve_last_send.tv_usec);
+            long remaining_us = RESOLVE_DELAY_US - elapsed_us;
+            if (remaining_us < 0) remaining_us = 0;
+            tv.tv_sec  = remaining_us / 1000000;
+            tv.tv_usec = remaining_us % 1000000;
             tvp = &tv;
         }
 
@@ -493,7 +605,7 @@ int main(void)
             perror("select"); exit(1);
         }
 
-        /* --- Timer tick handling --- */
+        /* --- Timer tick (action collection) --- */
         if (gs.phase == STATE_ACTION_COLLECTION) {
             time_t now = time(NULL);
             if (ready == 0 || now != last_tick) {
@@ -501,12 +613,36 @@ int main(void)
                     last_tick = now;
                     gs.timer_secs_left--;
                     send_timer_tick(&gs, gs.timer_secs_left);
-                    printf("[server] Timer: %d seconds left\n", gs.timer_secs_left);
+                    printf("[server] Timer: %d seconds left\n",
+                           gs.timer_secs_left);
                 }
                 if (gs.timer_secs_left <= 0) {
                     printf("[server] Time expired, resolving round.\n");
-                    resolve_round(&gs);
-                    last_tick = 0;
+                    start_resolution(&gs);
+                    continue;
+                }
+            }
+            if (ready == 0) continue;
+        }
+
+        /* --- Resolve event dispatch --- */
+        if (gs.phase == STATE_RESOLVING) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            long elapsed_us = (now.tv_sec - resolve_last_send.tv_sec) * 1000000L
+                            + (now.tv_usec - resolve_last_send.tv_usec);
+
+            if (elapsed_us >= RESOLVE_DELAY_US) {
+                if (gs.resolve_event_current < gs.resolve_event_count) {
+                    send_round_event(&gs,
+                        gs.resolve_events[gs.resolve_event_current]);
+                    gs.resolve_event_current++;
+                    gettimeofday(&resolve_last_send, NULL);
+                    printf("[server] Event %d/%d sent\n",
+                           gs.resolve_event_current,
+                           gs.resolve_event_count);
+                } else {
+                    finish_resolution(&gs);
                     continue;
                 }
             }
@@ -517,33 +653,28 @@ int main(void)
         if (FD_ISSET(listen_fd, &rfds)) {
             struct sockaddr_in client_addr;
             socklen_t addrlen = sizeof(client_addr);
-            int new_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addrlen);
+            int new_fd = accept(listen_fd,
+                                (struct sockaddr *)&client_addr, &addrlen);
             if (new_fd >= 0) {
-                if (gs.phase != STATE_LOBBY || gs.player_count >= MAX_PLAYERS) {
+                if (gs.phase != STATE_LOBBY ||
+                    gs.player_count >= MAX_PLAYERS) {
                     send_error(new_fd, "Cannot join: lobby full or game started.");
                     close(new_fd);
                 } else {
-                    /*
-                     * We don't know the player's name yet.
-                     * Temporarily store the fd in a player slot
-                     * so we can receive their MSG_JOIN.
-                     * Assign to a free slot with an empty name.
-                     */
                     int assigned = 0;
                     for (int i = 0; i < MAX_PLAYERS; i++) {
                         if (gs.players[i].fd == -1) {
-                            gs.players[i].fd      = new_fd;
-                            gs.players[i].alive   = 0;
+                            gs.players[i].fd       = new_fd;
+                            gs.players[i].alive    = 0;
                             gs.players[i].rbuf_len = 0;
                             memset(gs.players[i].name, 0, PLAYER_NAME_LEN);
                             assigned = 1;
-                            printf("[server] New connection on fd %d (slot %d)\n", new_fd, i);
+                            printf("[server] New connection fd %d (slot %d)\n",
+                                   new_fd, i);
                             break;
                         }
                     }
-                    if (!assigned) {
-                        close(new_fd);
-                    }
+                    if (!assigned) close(new_fd);
                 }
             }
         }
@@ -563,26 +694,21 @@ int main(void)
             }
             p->rbuf_len += (int)n;
             process_player_buffer(&gs, i);
-
-            if (gs.players[i].fd == -1) continue; /* was disconnected */
+            if (gs.players[i].fd == -1) continue;
         }
 
-        /* Game is started explicitly by the host via MSG_START_GAME */
-
-        /* --- Check if all actions collected (no timer needed) --- */
+        /* --- Check if all actions collected --- */
         if (gs.phase == STATE_ACTION_COLLECTION && game_all_actions_in(&gs)) {
             printf("[server] All actions received, resolving round.\n");
-            resolve_round(&gs);
-            last_tick = 0;
+            start_resolution(&gs);
         }
 
-        /* --- Check if game is over and everyone disconnected --- */
+        /* --- Game over, all disconnected --- */
         if (gs.phase == STATE_GAME_OVER) {
-            int still_connected = 0;
-            for (int i = 0; i < MAX_PLAYERS; i++) {
-                if (gs.players[i].fd != -1) still_connected++;
-            }
-            if (still_connected == 0) {
+            int still = 0;
+            for (int i = 0; i < MAX_PLAYERS; i++)
+                if (gs.players[i].fd != -1) still++;
+            if (still == 0) {
                 printf("[server] All players disconnected. Shutting down.\n");
                 break;
             }
