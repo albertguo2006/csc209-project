@@ -1,0 +1,453 @@
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds, calc}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage{enumitem}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    breaklines=true,
+    columns=fullflexible,
+    keepspaces=true,
+}
+
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+
+\title{\textbf{TermiNuke Battle Arena}\\[4pt]
+       \large CSC209 Assignment 3 --- Systems Programming Mini-Project\\[2pt]
+       \normalsize Project Documentation}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Project Overview}
+%% ============================================================
+
+\textbf{TermiNuke Battle Arena} is a multiplayer, turn-based battle arena game played entirely inside a terminal. It falls under \textbf{Category 2: Client--Server Application Using Sockets}. Between two and eight players connect to a central server over TCP, each selecting one of eight unique characters and then fighting in simultaneous-action rounds until only one player remains standing.
+
+\subsection*{What the application does}
+
+The server is authoritative: it tracks all game state, validates every player action, and resolves combat entirely on the server side. Clients are ``thin'' terminals that send player input and render the narrative text the server broadcasts. There is no shared state between clients; everything flows through the server.
+
+The game proceeds through four phases that form a state machine (declared in \texttt{game.h}, lines~12--17):
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Lobby} -- Players connect, enter a name, and pick one of eight characters from a displayed roster. The first player to join becomes the host.
+    \item \textbf{Action Collection} -- The host starts the game. Each round, every living player submits one action (and optionally a target) within a 30-second countdown timer. The server accepts submissions at any time during this window and confirms each with a \texttt{MSG\_WAIT} acknowledgement.
+    \item \textbf{Resolution} -- Once all actions are in (or the timer expires), the server executes moves in speed order, populates a queue of up to 16 narrative event strings, and drip-feeds them to every client at two-second intervals for dramatic effect.
+    \item \textbf{Game Over} -- The server announces the winner (or a tie if all remaining players are eliminated simultaneously) via \texttt{MSG\_GAME\_OVER}.
+\end{enumerate}
+
+\subsection*{Input and output}
+
+The \textbf{server} takes no command-line arguments. It listens on the port compiled in via the \texttt{PORT} macro (default 4242). It logs game events to \texttt{stdout}.
+
+The \textbf{client} is invoked as \texttt{./client <ip> <port>} and prompts the user for a player name. During the lobby the user types \texttt{pick <id>} (0--7) to select a character and \texttt{start} to begin (host only). During a round the user types \texttt{<action\_id> [target\_id]}, e.g.\ \texttt{0} to use their first move untargeted, or \texttt{2 3} to use their third move targeting player~3.
+
+The client output includes ANSI-coloured headers, a 20-character ASCII HP bar per player (rendered in \texttt{client.c}, \texttt{print\_hp\_bar}, line~63), and a typewriter-effect narrative display (15\,ms per character, \texttt{typewriter\_print}, line~76) during resolution.
+
+\subsection*{Key features}
+
+Eight playable characters (Albert Guo, Kaitlyn Zhu, Yibin Wang, Doug Ford, TTC, The Bitter TA, Jesus Christ, Karen Reid) each carry four unique moves, yielding 32 distinct abilities. A type-effectiveness matrix (five types: Student, Politician, Infrastructure, Teaching Staff, Divine) provides 1.5$\times$ damage multipliers. A rich status-effect system tracks over 30 independent per-player fields (poison, scrambled moves, shields, invulnerability, evasion, healing blocks, permanent buffs/debuffs, etc.) all defined in the \texttt{StatusEffects} struct in \texttt{game.h} (lines~23--104).
+
+%% ============================================================
+\section{Build Instructions}
+%% ============================================================
+
+The project builds with a single \texttt{make} invocation. All source files must be present in the same directory. No external libraries beyond the standard C library and \texttt{libm} are required.
+
+\begin{lstlisting}
+# Build both executables
+make
+
+# Optionally specify a different port (default is 4242)
+make PORT=5000
+\end{lstlisting}
+
+This produces two executables: \texttt{server} and \texttt{client}.
+
+\textbf{Running the server:}
+\begin{lstlisting}
+./server
+# Server listens on 0.0.0.0:4242
+\end{lstlisting}
+
+\textbf{Running clients} (one terminal per player):
+\begin{lstlisting}
+./client 127.0.0.1 4242
+\end{lstlisting}
+
+\textbf{Minimum requirements:} 2 players must connect and select characters before the host can type \texttt{start}. Up to 8 players can join simultaneously. The server shuts down cleanly once all clients have disconnected after a \texttt{GAME\_OVER} message is sent.
+
+\textbf{Compiler flags used} (see \texttt{Makefile}):
+\begin{lstlisting}
+gcc -Wall -Wextra -g -DPORT=4242 -o server server.c game.c -lm
+gcc -Wall -Wextra -g -DPORT=4242 -o client client.c
+\end{lstlisting}
+
+%% ============================================================
+\section{Architecture Diagram}
+%% ============================================================
+
+The diagram below shows the server process, up to eight client processes, the TCP socket connections between them, and the categories of messages that flow in each direction. All communication is defined in \texttt{protocol.h}.
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.4cm and 2.2cm,
+    every node/.style={font=\small},
+    server/.style={rectangle, draw=blue!70!black, fill=blue!10, thick,
+                   minimum width=3.8cm, minimum height=1.1cm, align=center},
+    client/.style={rectangle, draw=green!50!black, fill=green!8, thick,
+                   minimum width=2.6cm, minimum height=0.9cm, align=center},
+    file/.style={rectangle, draw=gray!60, fill=gray!8, thick,
+                 minimum width=2.2cm, minimum height=0.8cm, align=center},
+    arrow/.style={-{Stealth[length=6pt]}, thick},
+    darrow/.style={{Stealth[length=6pt]}-{Stealth[length=6pt]}, thick},
+]
+
+%% --- Server box ---
+\node[server] (srv) {\textbf{server}\\\texttt{server.c} + \texttt{game.c}\\port 4242 (TCP)};
+
+%% --- Clients ---
+\node[client, below left=2.8cm and 4.5cm of srv]  (c1) {\textbf{client 1}\\\texttt{client.c}};
+\node[client, below left=2.8cm and 1.4cm of srv]  (c2) {\textbf{client 2}\\\texttt{client.c}};
+\node[client, below right=2.8cm and 1.4cm of srv] (c3) {\textbf{client 3}\\\texttt{client.c}};
+\node[client, below right=2.8cm and 4.5cm of srv] (c4) {\textbf{client N}\\\texttt{client.c}};
+
+%% --- Dots ---
+\node at ($(c3)!0.5!(c4)$) {\large$\cdots$};
+
+%% --- Protocol header ---
+\node[file, above=0.8cm of srv] (proto) {\textbf{protocol.h}\\shared message types};
+\draw[arrow, dashed, gray] (proto) -- (srv);
+
+%% --- Arrows: client 1 ---
+\draw[arrow, color=red!70!black]
+    ([xshift=-5pt]c1.north) -- ([xshift=0pt]srv.south west);
+
+\draw[arrow, color=blue!70!black]
+    ([xshift=8pt]srv.south west) -- ([xshift=3pt]c1.north);
+
+%% --- Arrows: client 2 ---
+\draw[arrow, color=red!70!black]
+    ([xshift=-4pt]c2.north) -- ([xshift=-12pt]srv.south);
+\draw[arrow, color=blue!70!black]
+    ([xshift=-2pt]srv.south) -- ([xshift=4pt]c2.north);
+
+%% --- Arrows: client 3 ---
+\draw[arrow, color=red!70!black]
+    ([xshift=4pt]c3.north) -- ([xshift=12pt]srv.south);
+\draw[arrow, color=blue!70!black]
+    ([xshift=2pt]srv.south) -- ([xshift=-4pt]c3.north);
+
+%% --- Arrows: client N ---
+\draw[arrow, color=red!70!black]
+    ([xshift=5pt]c4.north) -- ([xshift=0pt]srv.south east);
+
+\draw[arrow, color=blue!70!black]
+    ([xshift=-8pt]srv.south east) -- ([xshift=-3pt]c4.north)
+
+%% --- Legend ---
+\node[draw=gray, fill=gray!5, rounded corners, font=\tiny, align=left,
+      below=0.5cm of c1, xshift=3.5cm]
+{
+  \textcolor{red!70!black}{$\rightarrow$} Client $\to$ Server (4 message types)\\
+  \textcolor{blue!70!black}{$\rightarrow$} Server $\to$ Client (11 message types, broadcast or unicast)\\
+  All messages: fixed-size binary structs over TCP (\texttt{protocol.h})
+};
+
+\end{tikzpicture}
+\end{center}
+
+The server's internal state machine (in \texttt{server.c} and \texttt{game.c}) is the sole source of truth. Clients maintain only the state required to render their UI and submit inputs. The \texttt{fd\_set} maintained in \texttt{main} (server.c, line~568--579) tracks the listen socket and every connected player socket simultaneously.
+
+%% ============================================================
+\section{Communication Protocol}
+%% ============================================================
+
+All messages are \textbf{fixed-width binary structs} defined in \texttt{protocol.h}. The first byte of every struct is always the \texttt{msg\_type} opcode. Because TCP is a stream protocol, both sides must know how many bytes to read; the opcode alone determines the struct type and thus the exact byte count expected. The server performs this dispatch in \texttt{process\_player\_buffer} (server.c, lines~392--434); the client does the same in its receive loop (\texttt{client.c}).
+
+\subsection*{Client $\to$ Server messages}
+
+\begingroup
+\small
+\begin{longtable}{@{}p{2.7cm} p{1.8cm} p{3.0cm} p{4.8cm}@{}}
+\toprule
+\textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} \\
+\midrule\endhead
+
+\textbf{MSG\_JOIN}\\(0x01) &
+33 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{char name[32];} &
+Sent immediately after the TCP connection is established. \texttt{name} is a null-terminated, printable-ASCII player name. The server sanitises non-printable bytes to \texttt{'?'} (server.c, line~257--258). If the lobby is full or the game has already started, the server sends \texttt{MSG\_ERROR} and closes the socket (server.c, line~248--252). \\[4pt]
+
+\textbf{MSG\_ACTION}\\(0x02) &
+4 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t action\_id;}\newline
+\texttt{uint8\_t target\_id;}\newline
+\texttt{uint8\_t padding;} &
+Sent during \texttt{STATE\_ACTION\_COLLECTION} only. \texttt{action\_id} is 0--3 (index into the player's four moves). \texttt{target\_id} is ignored for moves that do not require a target (\texttt{requires\_target==0}) and set to \texttt{NO\_TARGET} (0xFF) by the server. The server validates the action via \texttt{game\_validate\_action} (game.c) and returns \texttt{MSG\_ERROR} on any violation, or \texttt{MSG\_WAIT} on success. Duplicate submissions in the same round are rejected (server.c, line~319--322). \\[4pt]
+
+\textbf{MSG\_START\_GAME}\\(0x03) &
+4 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t padding[3];} &
+Sent by the host client to begin the game. Only accepted during \texttt{STATE\_LOBBY}; only the host player (the first to join) may send it. Requires at least 2 connected players all having selected characters (server.c, lines~353--386). \\[4pt]
+
+\textbf{MSG\_CHAR\_SELECT}\\(0x04) &
+4 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t char\_id;}\newline
+\texttt{uint8\_t padding[2];} &
+Sent during \texttt{STATE\_LOBBY} to claim a character slot (0--7). If the character is already taken or the index is invalid, \texttt{MSG\_ERROR} is returned. On success, a \texttt{MSG\_LOBBY\_UPDATE} and updated \texttt{MSG\_CHAR\_LIST} are broadcast to all connected players (server.c, lines~280--305). \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\subsection*{Server $\to$ Client messages}
+
+\begingroup
+\small
+\begin{longtable}{@{}p{2.7cm} p{1.5cm} p{3.2cm} p{4.6cm}@{}}
+\toprule
+\textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} \\
+\midrule\endhead
+
+\textbf{MSG\_JOIN\_ACK}\\(0x19) &
+4 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t your\_id;}\newline
+\texttt{uint8\_t is\_host;}\newline
+\texttt{uint8\_t padding;} &
+Unicast to the connecting client immediately after \texttt{MSG\_JOIN} is processed. \texttt{your\_id} is the player's permanent slot (0--7) for the session. \texttt{is\_host} is 1 if this player is the game host. \\[4pt]
+
+\textbf{MSG\_CHAR\_LIST}\\(0x1A) &
+\textasciitilde{}13\,KB &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t char\_count;}\newline
+\texttt{uint8\_t padding[2];}\newline
+\texttt{CharEntry chars[8];} &
+Unicast on join and broadcast after every character selection. Each \texttt{CharEntry} (protocol.h, line~89) contains the character's stats and all four \texttt{ActionDef} entries (name, description, target type). The \texttt{taken} field indicates whether the character is already claimed. \\[4pt]
+
+\textbf{MSG\_LOBBY\_UPDATE}\\(0x10) &
+\textasciitilde{}320 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t player\_count;}\newline
+\texttt{uint8\_t host\_id;}\newline
+\texttt{uint8\_t padding;}\newline
+\texttt{PlayerInfo players[8];} &
+Broadcast to all clients whenever the lobby changes (player joins, leaves, or picks a character). Each \texttt{PlayerInfo} (40 bytes) encodes player id, hp, alive flag, char type, speed, max hp, char id, and name. \\[4pt]
+
+\textbf{MSG\_GAME\_START}\\(0x11) &
+\textasciitilde{}1.4\,KB &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t your\_id;}\newline
+\texttt{uint8\_t player\_count;}\newline
+\texttt{uint8\_t action\_count;}\newline
+\texttt{PlayerInfo players[8];}\newline
+\texttt{ActionDef actions[4];} &
+Unicast to each player (server.c, line~103--122). \texttt{your\_id} reconfirms the player's slot. \texttt{actions} contains the full \texttt{ActionDef} list for \emph{that player's} chosen character, so the client can display move names without hardcoding game data. \\[4pt]
+
+\textbf{MSG\_ROUND\_START}\\(0x12) &
+\textasciitilde{}325 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t round\_num;}\newline
+\texttt{uint8\_t timer\_secs;}\newline
+\texttt{uint8\_t player\_count;}\newline
+\texttt{PlayerInfo players[8];} &
+Broadcast at the start of every action-collection phase. Contains a fresh snapshot of all player HP, speed, and alive status so clients always render accurate HP bars. \\[4pt]
+
+\textbf{MSG\_TIMER\_TICK}\\(0x13) &
+4 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t seconds\_left;}\newline
+\texttt{uint8\_t padding[2];} &
+Broadcast once per second during action collection (server.c, lines~609--626). Allows clients to display a live countdown. When \texttt{seconds\_left} reaches 0 the server proceeds to resolution regardless of missing submissions. \\[4pt]
+
+\textbf{MSG\_ROUND\_EVENT}\\(0x14) &
+260 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t padding[3];}\newline
+\texttt{char text[256];} &
+Broadcast during resolution, one event every two seconds (RESOLVE\_DELAY\_US = 2\,000\,000\,$\mu$s, server.c line~22). Each event is a null-terminated narrative string describing one combat action. Clients render these with a typewriter effect. \\[4pt]
+
+\textbf{MSG\_STATUS\_UPDATE}\\(0x1B) &
+516 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t padding[3];}\newline
+\texttt{char text[512];} &
+Unicast to each living player at the start of every round (server.c, lines~476--484). Contains a human-readable summary of that player's active status effects (poison stacks, debuffs, buffs, shield HP, etc.) built by \texttt{game\_build\_status\_text} (game.c). \\[4pt]
+
+\textbf{MSG\_PLAYER\_ELIM}\\(0x15) &
+36 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t player\_id;}\newline
+\texttt{uint8\_t padding[2];}\newline
+\texttt{char name[32];} &
+Broadcast when a player's HP reaches zero or they disconnect mid-game. Clients display a ``player eliminated'' notification. \\[4pt]
+
+\textbf{MSG\_GAME\_OVER}\\(0x16) &
+36 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t is\_tie;}\newline
+\texttt{uint8\_t winner\_id;}\newline
+\texttt{uint8\_t padding;}\newline
+\texttt{char winner\_name[32];} &
+Broadcast when one (or zero) players remain. \texttt{is\_tie} is 1 if multiple players were eliminated simultaneously. \texttt{winner\_id} is set to 0xFF on a tie. After this message clients display the result and exit. \\[4pt]
+
+\textbf{MSG\_WAIT}\\(0x18) &
+4 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t padding[3];} &
+Unicast acknowledgement sent to a player immediately after their \texttt{MSG\_ACTION} is accepted (server.c, line~344). Signals the client to stop prompting for input and wait for resolution. \\[4pt]
+
+\textbf{MSG\_ERROR}\\(0x17) &
+68 bytes &
+\texttt{uint8\_t msg\_type;}\newline
+\texttt{uint8\_t padding[3];}\newline
+\texttt{char message[64];} &
+Unicast error string. Sent for invalid actions, bad character selections, unauthorised start requests, and connection-refused conditions. The client prints the message; the connection is closed only for fatal errors (lobby full, game in progress). \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\subsection*{Message framing}
+
+Because TCP is a byte stream, partial writes are possible. Both sides use a \texttt{write\_all} helper (server.c, line~28; client.c, line~44) that loops on \texttt{write(2)} until all bytes are sent. On the receive side the server maintains a 256-byte per-player read buffer (\texttt{Player.rbuf}, game.h line~128) that accumulates partial reads; \texttt{process\_player\_buffer} (server.c, line~392) checks whether a full message is present before dispatching, and calls \texttt{memmove} to compact the buffer afterwards (server.c, line~430). The client uses a single 8\,KB \texttt{rbuf} (client.c, line~28) for the same purpose.
+
+%% ============================================================
+\section{Concurrency Model}
+%% ============================================================
+
+The server is \textbf{single-process, single-threaded}. It uses a single \texttt{select(2)} call to monitor all file descriptors simultaneously, never blocking on any one client. No \texttt{fork} or \texttt{pthread} calls are made; concurrency is achieved entirely through I/O multiplexing.
+
+\subsection*{The \texttt{fd\_set} contents}
+
+At the top of the main event loop (server.c, lines~567--579) the server rebuilds \texttt{rfds} on every iteration:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{The listen socket} (\texttt{listen\_fd}) --- monitors for new incoming TCP connections.
+    \item \textbf{All active player sockets} --- one entry per connected player slot (\texttt{gs.players[i].fd != -1}). Up to 8 player file descriptors, yielding at most 9 descriptors total in \texttt{rfds}.
+\end{itemize}
+
+\subsection*{Timeout logic}
+
+\texttt{select} is called with a \texttt{struct timeval *} that varies by game phase (server.c, lines~582--600):
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{\texttt{STATE\_ACTION\_COLLECTION}}: timeout = 1 second. On each timeout the server decrements \texttt{timer\_secs\_left}, broadcasts \texttt{MSG\_TIMER\_TICK}, and if the timer reaches zero it calls \texttt{start\_resolution} immediately.
+    \item \textbf{\texttt{STATE\_RESOLVING}}: timeout = time remaining until the next 2-second event slot, computed using \texttt{gettimeofday}. When the timeout fires the server sends the next queued narrative event (\texttt{MSG\_ROUND\_EVENT}) and updates \texttt{resolve\_last\_send}.
+    \item \textbf{\texttt{STATE\_LOBBY} / \texttt{STATE\_GAME\_OVER}}: no timeout (\texttt{tvp = NULL}); \texttt{select} blocks indefinitely until a socket event occurs.
+\end{itemize}
+
+\subsection*{Non-blocking guarantee}
+
+Because every \texttt{read} is gated behind \texttt{FD\_ISSET}, the server never calls \texttt{read} on a socket that is not ready. No socket is set to non-blocking mode; \texttt{select} provides all the necessary multiplexing. A slow or stalled client cannot cause the server to block, since the server only writes to clients after a complete resolution step (the 2-second delay ensures writes are staggered). The \texttt{write\_all} loop could theoretically block if the kernel write buffer is full; in practice, game messages are small (\textless14\,KB each) relative to the default TCP send buffer (typically 128\,KB or more), so this is not a concern for normal usage.
+
+\subsection*{Early exit when all actions are received}
+
+After processing each player's message, the server checks \texttt{game\_all\_actions\_in} (server.c, line~701). If every living player has submitted, resolution begins immediately without waiting for the timer to expire, keeping rounds snappy in practice.
+
+\subsection*{Client event loop}
+
+The client also uses \texttt{select} (client.c) to multiplex between two readable sources: the server socket and \texttt{stdin}. This lets the client simultaneously watch for incoming server messages (timer ticks, round events) while accepting the player's move input without blocking on either.
+
+%% ============================================================
+\section{Error Handling and Robustness}
+%% ============================================================
+
+\subsection*{1. Client disconnection mid-game}
+
+\textbf{What can go wrong:} A player closes their terminal or loses network connectivity while a round is in progress.
+
+\textbf{How it is handled:} Every \texttt{read} call on a player's socket is checked for $n \leq 0$ (server.c, line~691). A return value of 0 means the peer closed the connection; a negative value indicates an error. In both cases, \texttt{disconnect\_player} is called (server.c, line~692). This function (lines~217--240) closes the socket, sets \texttt{fd = -1} to remove it from the \texttt{fd\_set} on the next iteration, and frees the character slot. If the game is already in progress, \texttt{game\_remove\_player} marks the player as eliminated and broadcasts \texttt{MSG\_PLAYER\_ELIM} to remaining players. The game continues normally as long as at least one player survives; \texttt{game\_check\_end} handles the edge case where a disconnect reduces survivors to one.
+
+\subsection*{2. Unknown or malformed opcode}
+
+\textbf{What can go wrong:} A client sends a byte that does not correspond to any known \texttt{MsgType}, or it sends a message at the wrong time (e.g.\ \texttt{MSG\_ACTION} during the lobby phase).
+
+\textbf{How it is handled:} In \texttt{process\_player\_buffer} (server.c, lines~400--409), the \texttt{default} case of the dispatch \texttt{switch} logs the unknown opcode and immediately calls \texttt{disconnect\_player}, preventing the server from interpreting arbitrary bytes as a valid message and corrupting game state. For in-phase violations (e.g.\ submitting an action when \texttt{phase != STATE\_ACTION\_COLLECTION}), the server sends \texttt{MSG\_ERROR} over the client's socket (server.c, lines~315--318) and leaves the connection open so the player can retry.
+
+\subsection*{3. Duplicate action submission}
+
+\textbf{What can go wrong:} A client submits an action, receives \texttt{MSG\_WAIT}, and then sends another \texttt{MSG\_ACTION} before the round resolves (e.g.\ due to a UI bug or a misbehaving client).
+
+\textbf{How it is handled:} The server checks \texttt{p->pending\_action\_id != -1} (server.c, line~319). If an action is already registered, the server sends \texttt{MSG\_ERROR} with the message \textit{``You already submitted an action this round.''} and ignores the second submission. The player's original action is preserved.
+
+\subsection*{4. Full lobby or late join}
+
+\textbf{What can go wrong:} A client tries to connect after the game has started or when 8 players are already present.
+
+\textbf{How it is handled:} In the accept path (server.c, lines~659--663), the server immediately checks \texttt{gs.phase != STATE\_LOBBY || gs.player\_count >= MAX\_PLAYERS}. If either condition holds, it sends \texttt{MSG\_ERROR} with an explanatory string and closes the new file descriptor (server.c, line~661--662), preventing any new socket from entering the \texttt{fd\_set}.
+
+\subsection*{5. \texttt{write} failures (broken pipe)}
+
+\textbf{What can go wrong:} A client disconnects between a \texttt{select} poll and a subsequent \texttt{write}, causing \texttt{write(2)} to return $-1$ with \texttt{SIGPIPE} or \texttt{EPIPE}.
+
+\textbf{How it is handled:} \texttt{write\_all} (server.c, lines~28--39) returns $-1$ if any call to \texttt{write} fails. Currently, the broadcast path does not check the return value of \texttt{write\_all} for every client; this is an acknowledged limitation. For unicast messages (errors, wait, join ack) the calling context guards the write with a socket validity check. The OS will deliver \texttt{SIGPIPE} on a closed socket write; in a production-grade server this would be suppressed with \texttt{signal(SIGPIPE, SIG\_IGN)}. Failed individual player writes result in the server logging the disconnect on the next readable event.
+
+\subsection*{6. Action targeting a dead player}
+
+\textbf{What can go wrong:} A player submits \texttt{MSG\_ACTION} targeting the ID of a player who has just been eliminated.
+
+\textbf{How it is handled:} \texttt{game\_validate\_action} (game.c) checks that the target ID corresponds to a living player when the move requires an enemy target (\texttt{requires\_target == 1}). If the target is dead or out of range, the function writes a descriptive error string into the \texttt{err} buffer and returns $-1$; the server then sends this as \texttt{MSG\_ERROR} to the submitting player (server.c, lines~328--331), and the player must resubmit.
+
+%% ============================================================
+\section{Team Contributions}
+%% ============================================================
+
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Component} & \textbf{Member 1} & \textbf{Member 2} & \textbf{Member 3} \\
+\midrule
+\texttt{protocol.h} --- message struct definitions & & & \\
+\texttt{game.h} --- data structure design & & & \\
+\texttt{game.c} --- character \& move definitions & & & \\
+\texttt{game.c} --- damage pipeline (\texttt{apply\_damage}) & & & \\
+\texttt{game.c} --- status effect system & & & \\
+\texttt{game.c} --- action resolution \& sorting & & & \\
+\texttt{game.c} --- type effectiveness matrix & & & \\
+\texttt{server.c} --- TCP setup \& accept loop & & & \\
+\texttt{server.c} --- \texttt{select} event loop \& timer logic & & & \\
+\texttt{server.c} --- message handlers & & & \\
+\texttt{server.c} --- resolution drip-feed logic & & & \\
+\texttt{server.c} --- disconnect \& error handling & & & \\
+\texttt{client.c} --- socket connection \& send logic & & & \\
+\texttt{client.c} --- message receive \& dispatch & & & \\
+\texttt{client.c} --- terminal UI (HP bars, ANSI) & & & \\
+\texttt{client.c} --- typewriter effect \& timer display & & & \\
+\texttt{Makefile} --- build system & & & \\
+Project documentation (this report) & & & \\
+Demo video & & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
