@@ -46,6 +46,7 @@ static time_t         last_tick = 0;
 static struct timeval  resolve_last_send;
 
 /* Forward declarations */
+static void disconnect_player(GameState *gs, int player_id);
 static void send_game_start(GameState *gs);
 static void begin_round(GameState *gs);
 static void finish_resolution(GameState *gs);
@@ -57,8 +58,10 @@ static void finish_resolution(GameState *gs);
 static void broadcast(GameState *gs, const void *msg, size_t len)
 {
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (gs->players[i].fd != -1)
-            write_all(gs->players[i].fd, msg, len);
+        if (gs->players[i].fd != -1) {
+            if (write_all(gs->players[i].fd, msg, len) < 0)
+                disconnect_player(gs, i);
+        }
     }
 }
 

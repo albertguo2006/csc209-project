@@ -408,9 +408,9 @@ The client also uses \texttt{select} (client.c) to multiplex between two readabl
 
 \subsection*{5. \texttt{write} failures (broken pipe)}
 
-\textbf{What can go wrong:} A client disconnects between a \texttt{select} poll and a subsequent \texttt{write}, causing \texttt{write(2)} to return $-1$ with \texttt{SIGPIPE} or \texttt{EPIPE}.
+\textbf{What can go wrong:} A client disconnects between a \texttt{select} poll and a subsequent \texttt{write}, causing \texttt{write(2)} to return $-1$ with \texttt{EPIPE}.
 
-\textbf{How it is handled:} \texttt{write\_all} (server.c, lines~28--39) returns $-1$ if any call to \texttt{write} fails. Currently, the broadcast path does not check the return value of \texttt{write\_all} for every client; this is an acknowledged limitation. For unicast messages (errors, wait, join ack) the calling context guards the write with a socket validity check. The OS will deliver \texttt{SIGPIPE} on a closed socket write; in a production-grade server this would be suppressed with \texttt{signal(SIGPIPE, SIG\_IGN)}. Failed individual player writes result in the server logging the disconnect on the next readable event.
+\textbf{How it is handled:} \texttt{write\_all} (server.c, lines~28--39) returns $-1$ if any \texttt{write} call fails. The \texttt{broadcast} function (server.c, lines~57--64) checks this return value for every connected player; if \texttt{write\_all} fails for a given slot, \texttt{disconnect\_player} is called immediately, closing the socket and setting \texttt{fd = -1} before iteration continues. Because \texttt{disconnect\_player} nulls the file descriptor before any recursive broadcast it may trigger (e.g.\ \texttt{MSG\_PLAYER\_ELIM} during resolution), the failing player is safely skipped in all subsequent writes. Unicast helpers (\texttt{send\_error}, \texttt{send\_wait}, etc.) similarly rely on \texttt{write\_all}'s return value; the caller always guards writes with a socket validity check.
 
 \subsection*{6. Action targeting a dead player}
 
