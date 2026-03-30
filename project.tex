@@ -418,6 +418,51 @@ The client also uses \texttt{select} (client.c) to multiplex between two readabl
 
 \textbf{How it is handled:} \texttt{game\_validate\_action} (game.c) checks that the target ID corresponds to a living player when the move requires an enemy target (\texttt{requires\_target == 1}). If the target is dead or out of range, the function writes a descriptive error string into the \texttt{err} buffer and returns $-1$; the server then sends this as \texttt{MSG\_ERROR} to the submitting player (server.c, lines~328--331), and the player must resubmit.
 
+\subsection*{7. \texttt{select} interrupted by a signal (EINTR)}
+
+\textbf{What can go wrong:} A Unix signal (e.g.\ \texttt{SIGCHLD}, \texttt{SIGPIPE}, or an OS-level delivery) interrupts the blocking \texttt{select(2)} call before any file descriptor becomes ready, causing it to return $-1$ with \texttt{errno == EINTR}. Treating this as a fatal error would crash the server or disconnect the client.
+
+\textbf{How it is handled:} Both the server (server.c, line~607) and the client (client.c, line~520) check for \texttt{EINTR} immediately after \texttt{select} returns a negative value:
+\begin{lstlisting}
+if (ready < 0) {
+    if (errno == EINTR) continue;
+    perror("select"); exit(1);
+}
+\end{lstlisting}
+On \texttt{EINTR} the loop simply restarts, re-building the \texttt{fd\_set} and calling \texttt{select} again. Any other negative return (a genuine system error) is treated as fatal and logged with \texttt{perror}.
+
+\subsection*{8. Unauthorised or premature \texttt{MSG\_START\_GAME}}
+
+\textbf{What can go wrong:} Three distinct violations can occur around the start-game flow: (a) a non-host player sends \texttt{MSG\_START\_GAME}; (b) the host sends it while at least one connected player has not yet selected a character; or (c) the host sends it when fewer than two players have joined.
+
+\textbf{How it is handled:} \texttt{handle\_start\_game} (server.c, lines~356--388) checks each condition in order and sends \texttt{MSG\_ERROR} with a specific message for each:
+\begin{itemize}[leftmargin=2em]
+    \item \textit{``Only the host can start.''} --- if \texttt{player\_id != gs->host\_id} (line~358--361). The connection is left open so the non-host player can continue participating.
+    \item \textit{``All players must select a character first.''} --- if any connected player's \texttt{char\_id < 0} (lines~371--377). The host must wait for everyone to pick before retrying.
+    \item \textit{``Need at least 2 players to start.''} --- if \texttt{ready < MIN\_PLAYERS} (lines~379--383). This prevents a solo game from accidentally starting.
+\end{itemize}
+In all three cases the game remains in \texttt{STATE\_LOBBY} and no state is mutated, so the host can correct the situation and re-send \texttt{MSG\_START\_GAME}.
+
+\subsection*{9. Client stdin EOF (user closes terminal input)}
+
+\textbf{What can go wrong:} The user presses \texttt{Ctrl-D} or pipes input that ends, causing \texttt{fgets} on \texttt{stdin} to return \texttt{NULL}. Without handling this, the client could spin forever on the \texttt{select} loop or attempt to send garbage to the server.
+
+\textbf{How it is handled:} Both input paths in the client check the return value of \texttt{fgets}. In the lobby handler (client.c, lines~355--358) and the in-game handler (client.c, lines~417--420), a \texttt{NULL} return immediately closes the socket and calls \texttt{exit(0)}:
+\begin{lstlisting}
+if (fgets(line, sizeof(line), stdin) == NULL) {
+    printf("EOF on stdin, disconnecting.\n");
+    close(sockfd);
+    exit(0);
+}
+\end{lstlisting}
+Closing the socket triggers a \texttt{read} return of 0 on the server side, which calls \texttt{disconnect\_player} and handles the departure just as any other disconnection.
+
+\subsection*{10. Player eliminated by status-effect tick before action collection}
+
+\textbf{What can go wrong:} At the start of each round, \texttt{begin\_round} calls \texttt{game\_tick\_effects} to apply ongoing status effects (e.g.\ poison damage). If a player's HP reaches zero during this tick, the round must end immediately rather than entering action collection with zero or one living player.
+
+\textbf{How it is handled:} After ticking effects, \texttt{begin\_round} (server.c, lines~456--470) calls \texttt{game\_check\_end} before transitioning to \texttt{STATE\_ACTION\_COLLECTION}. If the check returns non-zero (one or zero survivors), the server broadcasts any pending \texttt{MSG\_PLAYER\_ELIM} messages, sets \texttt{phase = STATE\_GAME\_OVER}, and sends \texttt{MSG\_GAME\_OVER} without ever opening the action-collection window. This prevents a round from starting in an already-resolved state and ensures the game always terminates cleanly even when poison or other damage-over-time effects deliver the killing blow between rounds.
+
 %% ============================================================
 \section{Team Contributions}
 %% ============================================================
