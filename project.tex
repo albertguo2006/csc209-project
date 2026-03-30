@@ -186,25 +186,26 @@ The diagram below shows the server process, up to eight client processes, the TC
 The server's internal state machine (in \texttt{server.c} and \texttt{game.c}) is the sole source of truth. Clients maintain only the state required to render their UI and submit inputs. The \texttt{fd\_set} maintained in \texttt{main} (server.c, line~568--579) tracks the listen socket and every connected player socket simultaneously.
 
 %% ============================================================
-\section{Communication Protocol}
+\section{Communication Protocol and Error Handling}
 %% ============================================================
 
-All messages are \textbf{fixed-width binary structs} defined in \texttt{protocol.h}. The first byte of every struct is always the \texttt{msg\_type} opcode. Because TCP is a stream protocol, both sides must know how many bytes to read; the opcode alone determines the struct type and thus the exact byte count expected. The server performs this dispatch in \texttt{process\_player\_buffer} (server.c, lines~392--434); the client does the same in its receive loop (\texttt{client.c}).
+All messages are \textbf{fixed-width binary structs} defined in \texttt{protocol.h}. The first byte of every struct is always the \texttt{msg\_type} opcode. Because TCP is a stream protocol, both sides must know how many bytes to read; the opcode alone determines the struct type and thus the exact byte count expected. The server dispatches incoming messages in \texttt{process\_player\_buffer} (server.c, lines~392--434); the client dispatches server messages in \texttt{process\_server\_buffer} (client.c, lines~278--324). The \textbf{Error Handling} column below documents what occurs when a message is malformed, arrives in the wrong game state, or when the underlying \texttt{write(2)} or \texttt{read(2)} call fails.
 
 \subsection*{Client $\to$ Server messages}
 
 \begingroup
 \small
-\begin{longtable}{@{}p{2.7cm} p{1.8cm} p{3.0cm} p{4.8cm}@{}}
+\begin{longtable}{@{}p{2.0cm} p{1.2cm} p{2.4cm} p{3.2cm} p{4.6cm}@{}}
 \toprule
-\textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} \\
+\textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} & \textbf{Error Handling} \\
 \midrule\endhead
 
 \textbf{MSG\_JOIN}\\(0x01) &
 33 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{char name[32];} &
-Sent immediately after the TCP connection is established. \texttt{name} is a null-terminated, printable-ASCII player name. The server sanitises non-printable bytes to \texttt{'?'} (server.c, line~257--258). If the lobby is full or the game has already started, the server sends \texttt{MSG\_ERROR} and closes the socket (server.c, line~248--252). \\[4pt]
+Sent immediately after the TCP connection is established. \texttt{name} is a null-terminated, printable-ASCII player name. &
+\textbf{Server:} (1)~Game already in progress $\Rightarrow$ \texttt{MSG\_ERROR} ``Game already in progress.''\ + close socket (server.c:251--254). (2)~Lobby full $\Rightarrow$ \texttt{MSG\_ERROR} ``Lobby is full.''\ + close socket (server.c:264--267). (3)~Non-printable bytes in \texttt{name} sanitised to \texttt{'?'} (server.c:260--261); no error is sent. \textbf{Client send:} \texttt{write\_all} failure $\Rightarrow$ \texttt{perror("write")} + \texttt{exit(1)} (client.c:505--508). \\[4pt]
 
 \textbf{MSG\_ACTION}\\(0x02) &
 4 bytes &
@@ -212,20 +213,23 @@ Sent immediately after the TCP connection is established. \texttt{name} is a nul
 \texttt{uint8\_t action\_id;}\newline
 \texttt{uint8\_t target\_id;}\newline
 \texttt{uint8\_t padding;} &
-Sent during \texttt{STATE\_ACTION\_COLLECTION} only. \texttt{action\_id} is 0--3 (index into the player's four moves). \texttt{target\_id} is ignored for moves that do not require a target (\texttt{requires\_target==0}) and set to \texttt{NO\_TARGET} (0xFF) by the server. The server validates the action via \texttt{game\_validate\_action} (game.c) and returns \texttt{MSG\_ERROR} on any violation, or \texttt{MSG\_WAIT} on success. Duplicate submissions in the same round are rejected (server.c, line~319--322). \\[4pt]
+Sent during \texttt{STATE\_ACTION\_COLLECTION} only. \texttt{action\_id} is 0--3. \texttt{target\_id} is forced to \texttt{NO\_TARGET} (0xFF) for untargeted moves. On success the server sends \texttt{MSG\_WAIT}. &
+\textbf{Server:} (1)~Wrong game phase $\Rightarrow$ \texttt{MSG\_ERROR} ``Not currently accepting actions.''\ (server.c:318--320). (2)~Duplicate submission $\Rightarrow$ \texttt{MSG\_ERROR} ``You already submitted an action this round.''\ (server.c:322--324); original action preserved. (3)~Invalid \texttt{action\_id} or dead/out-of-range target $\Rightarrow$ \texttt{MSG\_ERROR} with specific string from \texttt{game\_validate\_action} (server.c:331--334); connection stays open so player can resubmit. \textbf{Client send:} \texttt{write\_all} failure $\Rightarrow$ \texttt{perror("write")} + \texttt{exit(1)} (client.c:449--452). Client also guards locally: a targeted move submitted without a target ID prints a usage hint without sending (client.c:436--440). \\[4pt]
 
 \textbf{MSG\_START\_GAME}\\(0x03) &
 4 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t padding[3];} &
-Sent by the host client to begin the game. Only accepted during \texttt{STATE\_LOBBY}; only the host player (the first to join) may send it. Requires at least 2 connected players all having selected characters (server.c, lines~353--386). \\[4pt]
+Sent by the host to begin the game. Only accepted during \texttt{STATE\_LOBBY} with $\geq$2 connected players, all having selected characters. &
+\textbf{Server:} (1)~Non-host sender $\Rightarrow$ \texttt{MSG\_ERROR} ``Only the host can start.''\ (server.c:358--361); connection left open. (2)~Game already started $\Rightarrow$ \texttt{MSG\_ERROR} ``Game already started.''\ (server.c:362--365). (3)~Any connected player has no character $\Rightarrow$ \texttt{MSG\_ERROR} ``All players must select a character first.''\ (server.c:371--377). (4)~Fewer than 2 players $\Rightarrow$ \texttt{MSG\_ERROR} ``Need at least 2 players to start.''\ (server.c:379--383). In all four cases the game stays in \texttt{STATE\_LOBBY} and no state is mutated. \textbf{Client send:} \texttt{write\_all} failure $\Rightarrow$ \texttt{perror("write")} + \texttt{exit(1)} (client.c:384--387). \\[4pt]
 
 \textbf{MSG\_CHAR\_SELECT}\\(0x04) &
 4 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t char\_id;}\newline
 \texttt{uint8\_t padding[2];} &
-Sent during \texttt{STATE\_LOBBY} to claim a character slot (0--7). If the character is already taken or the index is invalid, \texttt{MSG\_ERROR} is returned. On success, a \texttt{MSG\_LOBBY\_UPDATE} and updated \texttt{MSG\_CHAR\_LIST} are broadcast to all connected players (server.c, lines~280--305). \\
+Sent during \texttt{STATE\_LOBBY} to claim character slot 0--7. On success, \texttt{MSG\_LOBBY\_UPDATE} and updated \texttt{MSG\_CHAR\_LIST} are broadcast to all players (server.c:303--307). &
+\textbf{Server:} (1)~Not in lobby phase $\Rightarrow$ \texttt{MSG\_ERROR} ``Can't change character now.''\ (server.c:289--292); connection left open. (2)~\texttt{char\_id} out of range or character already taken $\Rightarrow$ \texttt{MSG\_ERROR} ``Character unavailable or invalid.''\ (server.c:294--297); player may retry with a different ID. \textbf{Client send:} \texttt{write\_all} failure $\Rightarrow$ \texttt{perror("write")} + \texttt{exit(1)} (client.c:369--372). \\
 \bottomrule
 \end{longtable}
 \endgroup
@@ -234,9 +238,9 @@ Sent during \texttt{STATE\_LOBBY} to claim a character slot (0--7). If the chara
 
 \begingroup
 \small
-\begin{longtable}{@{}p{2.7cm} p{1.5cm} p{3.2cm} p{4.6cm}@{}}
+\begin{longtable}{@{}p{2.0cm} p{1.2cm} p{2.4cm} p{3.0cm} p{4.8cm}@{}}
 \toprule
-\textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} \\
+\textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} & \textbf{Error Handling} \\
 \midrule\endhead
 
 \textbf{MSG\_JOIN\_ACK}\\(0x19) &
@@ -245,64 +249,72 @@ Sent during \texttt{STATE\_LOBBY} to claim a character slot (0--7). If the chara
 \texttt{uint8\_t your\_id;}\newline
 \texttt{uint8\_t is\_host;}\newline
 \texttt{uint8\_t padding;} &
-Unicast to the connecting client immediately after \texttt{MSG\_JOIN} is processed. \texttt{your\_id} is the player's permanent slot (0--7) for the session. \texttt{is\_host} is 1 if this player is the game host. \\[4pt]
+Unicast to the connecting client immediately after \texttt{MSG\_JOIN} is processed. \texttt{your\_id} is the player's permanent slot (0--7); \texttt{is\_host} is 1 if this player is the game host. &
+\textbf{Server write:} sent via \texttt{write\_all} in \texttt{send\_join\_ack} (server.c:206--214); failure is not checked individually. The subsequent \texttt{send\_lobby\_update} call uses \texttt{broadcast}, which checks \texttt{write\_all} for every slot and calls \texttt{disconnect\_player} on any failure (server.c:62--63), so the broken socket is detected within the same connection-handling step. \textbf{Client receive:} always structurally valid when sent; unknown opcodes from the server cause \texttt{process\_server\_buffer} to return \texttt{-1}, breaking the event loop (client.c:297--300). \\[4pt]
 
 \textbf{MSG\_CHAR\_LIST}\\(0x1A) &
-\textasciitilde{}13\,KB &
+$\approx$13\,KB &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t char\_count;}\newline
 \texttt{uint8\_t padding[2];}\newline
 \texttt{CharEntry chars[8];} &
-Unicast on join and broadcast after every character selection. Each \texttt{CharEntry} (protocol.h, line~89) contains the character's stats and all four \texttt{ActionDef} entries (name, description, target type). The \texttt{taken} field indicates whether the character is already claimed. \\[4pt]
+Unicast on join and broadcast after every character selection. Each \texttt{CharEntry} (protocol.h, line~89) contains stats and all four \texttt{ActionDef} entries. The \texttt{taken} field marks already-claimed characters. &
+\textbf{Server write:} sent via \texttt{write\_all} in \texttt{send\_char\_list} (server.c:103); failure not individually checked. The \texttt{send\_lobby\_update} broadcast that immediately follows detects any broken socket and calls \texttt{disconnect\_player} (server.c:62--63). \textbf{Client receive:} always structurally valid. \\[4pt]
 
 \textbf{MSG\_LOBBY\_UPDATE}\\(0x10) &
-\textasciitilde{}320 bytes &
+$\approx$320 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t player\_count;}\newline
 \texttt{uint8\_t host\_id;}\newline
 \texttt{uint8\_t padding;}\newline
 \texttt{PlayerInfo players[8];} &
-Broadcast to all clients whenever the lobby changes (player joins, leaves, or picks a character). Each \texttt{PlayerInfo} (40 bytes) encodes player id, hp, alive flag, char type, speed, max hp, char id, and name. \\[4pt]
+Broadcast to all clients whenever the lobby changes (player joins, leaves, or picks a character). Each \texttt{PlayerInfo} (40 bytes) encodes player id, hp, alive flag, char type, speed, max hp, char id, and name. &
+\textbf{Server write:} sent via \texttt{broadcast} (server.c:93); \texttt{write\_all} failure for any slot $\Rightarrow$ \texttt{disconnect\_player} called immediately for that slot (server.c:62--63); remaining players continue to receive the update uninterrupted. \textbf{Client receive:} always structurally valid. \\[4pt]
 
 \textbf{MSG\_GAME\_START}\\(0x11) &
-\textasciitilde{}1.4\,KB &
+$\approx$1.4\,KB &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t your\_id;}\newline
 \texttt{uint8\_t player\_count;}\newline
 \texttt{uint8\_t action\_count;}\newline
 \texttt{PlayerInfo players[8];}\newline
 \texttt{ActionDef actions[4];} &
-Unicast to each player (server.c, line~103--122). \texttt{your\_id} reconfirms the player's slot. \texttt{actions} contains the full \texttt{ActionDef} list for \emph{that player's} chosen character, so the client can display move names without hardcoding game data. \\[4pt]
+Unicast to each player (server.c:108--124). \texttt{actions} carries the four moves for \emph{that player's} chosen character so the client can display them without hardcoding game data. &
+\textbf{Server write:} sent per-player via \texttt{write\_all} (server.c:123); failure not checked individually. Any player whose socket broke will be caught by the \texttt{send\_round\_start} broadcast (which calls \texttt{disconnect\_player}) that executes immediately after in \texttt{begin\_round}. \textbf{Client receive:} always structurally valid; stores \texttt{my\_id} and the action list for the remainder of the session. \\[4pt]
 
 \textbf{MSG\_ROUND\_START}\\(0x12) &
-\textasciitilde{}325 bytes &
+$\approx$325 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t round\_num;}\newline
 \texttt{uint8\_t timer\_secs;}\newline
 \texttt{uint8\_t player\_count;}\newline
 \texttt{PlayerInfo players[8];} &
-Broadcast at the start of every action-collection phase. Contains a fresh snapshot of all player HP, speed, and alive status so clients always render accurate HP bars. \\[4pt]
+Broadcast at the start of every action-collection phase. Contains a fresh snapshot of all player HP, speed, and alive status so clients always render accurate HP bars. &
+\textbf{Server write:} sent via \texttt{broadcast} (server.c:136); \texttt{write\_all} failure $\Rightarrow$ \texttt{disconnect\_player} (server.c:62--63). \textbf{Client receive:} resets per-round state flags (\texttt{waiting\_for\_result}, \texttt{in\_resolution}) and sets \texttt{need\_prompt = 1} to trigger the action prompt on the next event-loop iteration; always structurally valid. \\[4pt]
 
 \textbf{MSG\_TIMER\_TICK}\\(0x13) &
 4 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t seconds\_left;}\newline
 \texttt{uint8\_t padding[2];} &
-Broadcast once per second during action collection (server.c, lines~609--626). Allows clients to display a live countdown. When \texttt{seconds\_left} reaches 0 the server proceeds to resolution regardless of missing submissions. \\[4pt]
+Broadcast once per second during action collection (server.c, lines~609--626). When \texttt{seconds\_left} reaches 0 the server proceeds to resolution regardless of missing submissions. &
+\textbf{Server write:} sent via \texttt{broadcast} (server.c:146); \texttt{write\_all} failure $\Rightarrow$ \texttt{disconnect\_player}. Because ticks fire every second, a broken socket is detected within at most one additional second. \textbf{Client receive:} always structurally valid; updates the countdown display or a ``waiting'' status line depending on \texttt{waiting\_for\_result}. \\[4pt]
 
 \textbf{MSG\_ROUND\_EVENT}\\(0x14) &
 260 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t padding[3];}\newline
 \texttt{char text[256];} &
-Broadcast during resolution, one event every two seconds (RESOLVE\_DELAY\_US = 2\,000\,000\,$\mu$s, server.c line~22). Each event is a null-terminated narrative string describing one combat action. Clients render these with a typewriter effect. \\[4pt]
+Broadcast during resolution, one event every two seconds (RESOLVE\_DELAY\_US\,=\,2\,000\,000\,$\mu$s, server.c:22). Each event is a null-terminated narrative string describing one combat action. &
+\textbf{Server write:} sent via \texttt{broadcast} (server.c:155); \texttt{write\_all} failure $\Rightarrow$ \texttt{disconnect\_player}. \textbf{Client receive:} always structurally valid; sets \texttt{in\_resolution = 1}, which suppresses the action prompt until the next \texttt{MSG\_ROUND\_START} is received. \\[4pt]
 
 \textbf{MSG\_STATUS\_UPDATE}\\(0x1B) &
 516 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t padding[3];}\newline
 \texttt{char text[512];} &
-Unicast to each living player at the start of every round (server.c, lines~476--484). Contains a human-readable summary of that player's active status effects (poison stacks, debuffs, buffs, shield HP, etc.) built by \texttt{game\_build\_status\_text} (game.c). \\[4pt]
+Unicast to each living player at the start of every round (server.c, lines~479--487). Contains a human-readable summary of active status effects built by \texttt{game\_build\_status\_text} (game.c). &
+\textbf{Server write:} sent via \texttt{write\_all} only to players with \texttt{alive \&\& fd != -1} (server.c:481--487); write failure not individually checked. The \texttt{send\_round\_start} broadcast immediately preceding this loop has already disconnected any players with broken sockets (setting their \texttt{fd = -1}), so the alive-and-connected guard ensures no write is attempted to a dead socket. \textbf{Client receive:} always structurally valid. \\[4pt]
 
 \textbf{MSG\_PLAYER\_ELIM}\\(0x15) &
 36 bytes &
@@ -310,7 +322,8 @@ Unicast to each living player at the start of every round (server.c, lines~476--
 \texttt{uint8\_t player\_id;}\newline
 \texttt{uint8\_t padding[2];}\newline
 \texttt{char name[32];} &
-Broadcast when a player's HP reaches zero or they disconnect mid-game. Clients display a ``player eliminated'' notification. \\[4pt]
+Broadcast when a player's HP reaches zero or they disconnect mid-game. Clients display a ``player eliminated'' notification. &
+\textbf{Server write:} sent via \texttt{broadcast} (server.c:174); \texttt{write\_all} failure $\Rightarrow$ \texttt{disconnect\_player}. The eliminated player's \texttt{fd} is already set to \texttt{-1} before the broadcast, so they are safely skipped in the loop (server.c:60--61). \textbf{Client receive:} always structurally valid. \\[4pt]
 
 \textbf{MSG\_GAME\_OVER}\\(0x16) &
 36 bytes &
@@ -319,27 +332,52 @@ Broadcast when a player's HP reaches zero or they disconnect mid-game. Clients d
 \texttt{uint8\_t winner\_id;}\newline
 \texttt{uint8\_t padding;}\newline
 \texttt{char winner\_name[32];} &
-Broadcast when one (or zero) players remain. \texttt{is\_tie} is 1 if multiple players were eliminated simultaneously. \texttt{winner\_id} is set to 0xFF on a tie. After this message clients display the result and exit. \\[4pt]
+Broadcast when one (or zero) players remain. \texttt{is\_tie} is 1 if multiple players eliminated simultaneously; \texttt{winner\_id} is 0xFF on a tie. &
+\textbf{Server write:} sent via \texttt{broadcast} (server.c:186); \texttt{write\_all} failure $\Rightarrow$ \texttt{disconnect\_player}. After this message the server enters \texttt{STATE\_GAME\_OVER} and shuts down once all player sockets close (server.c:710--718). \textbf{Client receive:} sets \texttt{game\_over = 1} and displays the result; the event loop continues until the socket closes, at which point \texttt{read} returns 0 and the client exits cleanly (client.c:529--531). \\[4pt]
 
 \textbf{MSG\_WAIT}\\(0x18) &
 4 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t padding[3];} &
-Unicast acknowledgement sent to a player immediately after their \texttt{MSG\_ACTION} is accepted (server.c, line~344). Signals the client to stop prompting for input and wait for resolution. \\[4pt]
+Unicast acknowledgement sent to a player after their \texttt{MSG\_ACTION} is accepted (server.c:347). Signals the client to stop prompting for input and wait for resolution. &
+\textbf{Server write:} sent via \texttt{write\_all} in \texttt{send\_wait} (server.c:198--204); failure not checked. Crucially, the player's \texttt{pending\_action\_id} is recorded \emph{before} the send (server.c:344--345), so the action is preserved even if delivery fails. The next \texttt{broadcast} will detect the broken socket. \textbf{Client receive:} sets \texttt{waiting\_for\_result = 1} and suppresses further input prompts; always structurally valid. \\[4pt]
 
 \textbf{MSG\_ERROR}\\(0x17) &
 68 bytes &
 \texttt{uint8\_t msg\_type;}\newline
 \texttt{uint8\_t padding[3];}\newline
 \texttt{char message[64];} &
-Unicast error string. Sent for invalid actions, bad character selections, unauthorised start requests, and connection-refused conditions. The client prints the message; the connection is closed only for fatal errors (lobby full, game in progress). \\
+Unicast error string for invalid actions, bad character selections, unauthorised start requests, and connection-refused conditions. Fatal errors are followed immediately by socket close. &
+\textbf{Server write:} sent via \texttt{write\_all} in \texttt{send\_error} (server.c:189--196); failure not checked (best-effort delivery). For fatal errors (lobby full, game in progress) the server closes the socket immediately after \texttt{send\_error} (server.c:253, 266--267), ensuring the client detects disconnection via \texttt{read} returning 0. \textbf{Client receive:} prints the message in red (\texttt{on\_error}, client.c:260--264); connection stays open for non-fatal errors so the player may retry. For fatal errors, the server-side close triggers \texttt{read} returning 0 on the client, which prints ``Server closed connection.''\ and exits (client.c:529--531). \\
 \bottomrule
 \end{longtable}
 \endgroup
 
 \subsection*{Message framing}
 
-Because TCP is a byte stream, partial writes are possible. Both sides use a \texttt{write\_all} helper (server.c, line~28; client.c, line~44) that loops on \texttt{write(2)} until all bytes are sent. On the receive side the server maintains a 256-byte per-player read buffer (\texttt{Player.rbuf}, game.h line~128) that accumulates partial reads; \texttt{process\_player\_buffer} (server.c, line~392) checks whether a full message is present before dispatching, and calls \texttt{memmove} to compact the buffer afterwards (server.c, line~430). The client uses a single 8\,KB \texttt{rbuf} (client.c, line~28) for the same purpose.
+Because TCP is a byte stream, partial writes are possible. Both sides use a \texttt{write\_all} helper (server.c, line~28; client.c, line~44) that loops on \texttt{write(2)} until all bytes are sent or an error occurs. On the receive side the server maintains a 256-byte per-player read buffer (\texttt{Player.rbuf}, game.h line~128) that accumulates partial reads; \texttt{process\_player\_buffer} (server.c, line~392) checks whether a full message is present before dispatching, and calls \texttt{memmove} to compact the buffer afterwards (server.c, line~430). The client uses a single 8\,KB \texttt{rbuf} (client.c, line~28) for the same purpose.
+
+\subsection*{Cross-cutting error handling}
+
+The following concerns affect the protocol as a whole rather than any individual message type.
+
+\textbf{1. Client disconnection mid-game.} Every \texttt{read} on a player socket is checked for $n \leq 0$ (server.c, line~694). Zero means a clean peer close; negative means an I/O error. In both cases \texttt{disconnect\_player} is called (server.c, line~695), which closes the socket, sets \texttt{fd = -1} to remove it from the \texttt{fd\_set} on the next iteration, and frees the character slot. If the game is in progress, \texttt{game\_remove\_player} marks the player as eliminated and \texttt{MSG\_PLAYER\_ELIM} is broadcast to remaining players. \texttt{game\_check\_end} handles the edge case where a disconnect reduces survivors to one.
+
+\textbf{2. Unknown or malformed opcode.} In \texttt{process\_player\_buffer} (server.c, lines~400--413), the \texttt{default} branch logs the unknown opcode and immediately calls \texttt{disconnect\_player}, preventing the server from interpreting arbitrary bytes as valid messages and corrupting game state. Symmetrically, in \texttt{process\_server\_buffer} (client.c, lines~297--300), an unknown server opcode causes a return of \texttt{-1}, which breaks the client event loop and closes the socket.
+
+\textbf{3. Write failures (broken pipe).} \texttt{write\_all} returns \texttt{-1} on any \texttt{write(2)} failure including \texttt{EPIPE}. Helpers that use \texttt{broadcast} (server.c, lines~58--66) check the return value per player and call \texttt{disconnect\_player} on failure. Unicast helpers (\texttt{send\_error}, \texttt{send\_wait}, \texttt{send\_join\_ack}, \texttt{send\_char\_list}, \texttt{send\_game\_start}, \texttt{send\_status\_update}) do not check individually; broken sockets in those paths are caught at the next \texttt{broadcast} call. Because \texttt{disconnect\_player} sets \texttt{fd = -1} before any recursive broadcast it may trigger, no slot is written to twice after disconnection.
+
+\textbf{4. \texttt{select} interrupted by signal (EINTR).} Both the server (server.c, line~607) and the client (client.c, line~520) check \texttt{errno == EINTR} after a negative \texttt{select} return and restart the loop with a \texttt{continue}. Any other negative return is treated as fatal and reported with \texttt{perror}:
+\begin{lstlisting}
+if (ready < 0) {
+    if (errno == EINTR) continue;
+    perror("select"); exit(1);
+}
+\end{lstlisting}
+
+\textbf{5. Client stdin EOF.} In both the lobby handler (client.c, lines~355--358) and the in-game handler (client.c, lines~417--420), a \texttt{NULL} return from \texttt{fgets} closes the socket and calls \texttt{exit(0)}. Closing the socket triggers \texttt{read} returning 0 on the server, which invokes \texttt{disconnect\_player} and handles the departure identically to any other disconnection.
+
+\textbf{6. Player eliminated by status-effect tick before action collection.} \texttt{begin\_round} (server.c, lines~443--488) calls \texttt{game\_tick\_effects} and then immediately calls \texttt{game\_check\_end} before transitioning to \texttt{STATE\_ACTION\_COLLECTION}. If the check returns non-zero (one or zero survivors), the server broadcasts \texttt{MSG\_PLAYER\_ELIM} for each newly dead player, sets \texttt{phase = STATE\_GAME\_OVER}, and sends \texttt{MSG\_GAME\_OVER} without opening the action-collection window, ensuring the game always terminates cleanly even when damage-over-time effects deliver the killing blow between rounds.
 
 %% ============================================================
 \section{Concurrency Model}
@@ -377,91 +415,6 @@ After processing each player's message, the server checks \texttt{game\_all\_act
 \subsection*{Client event loop}
 
 The client also uses \texttt{select} (client.c) to multiplex between two readable sources: the server socket and \texttt{stdin}. This lets the client simultaneously watch for incoming server messages (timer ticks, round events) while accepting the player's move input without blocking on either.
-
-%% ============================================================
-\section{Error Handling and Robustness}
-%% ============================================================
-
-\subsection*{1. Client disconnection mid-game}
-
-\textbf{What can go wrong:} A player closes their terminal or loses network connectivity while a round is in progress.
-
-\textbf{How it is handled:} Every \texttt{read} call on a player's socket is checked for $n \leq 0$ (server.c, line~691). A return value of 0 means the peer closed the connection; a negative value indicates an error. In both cases, \texttt{disconnect\_player} is called (server.c, line~692). This function (lines~217--240) closes the socket, sets \texttt{fd = -1} to remove it from the \texttt{fd\_set} on the next iteration, and frees the character slot. If the game is already in progress, \texttt{game\_remove\_player} marks the player as eliminated and broadcasts \texttt{MSG\_PLAYER\_ELIM} to remaining players. The game continues normally as long as at least one player survives; \texttt{game\_check\_end} handles the edge case where a disconnect reduces survivors to one.
-
-\subsection*{2. Unknown or malformed opcode}
-
-\textbf{What can go wrong:} A client sends a byte that does not correspond to any known \texttt{MsgType}, or it sends a message at the wrong time (e.g.\ \texttt{MSG\_ACTION} during the lobby phase).
-
-\textbf{How it is handled:} In \texttt{process\_player\_buffer} (server.c, lines~400--409), the \texttt{default} case of the dispatch \texttt{switch} logs the unknown opcode and immediately calls \texttt{disconnect\_player}, preventing the server from interpreting arbitrary bytes as a valid message and corrupting game state. For in-phase violations (e.g.\ submitting an action when \texttt{phase != STATE\_ACTION\_COLLECTION}), the server sends \texttt{MSG\_ERROR} over the client's socket (server.c, lines~315--318) and leaves the connection open so the player can retry.
-
-\subsection*{3. Duplicate action submission}
-
-\textbf{What can go wrong:} A client submits an action, receives \texttt{MSG\_WAIT}, and then sends another \texttt{MSG\_ACTION} before the round resolves (e.g.\ due to a UI bug or a misbehaving client).
-
-\textbf{How it is handled:} The server checks \texttt{p->pending\_action\_id != -1} (server.c, line~319). If an action is already registered, the server sends \texttt{MSG\_ERROR} with the message \textit{``You already submitted an action this round.''} and ignores the second submission. The player's original action is preserved.
-
-\subsection*{4. Full lobby or late join}
-
-\textbf{What can go wrong:} A client tries to connect after the game has started or when 8 players are already present.
-
-\textbf{How it is handled:} In the accept path (server.c, lines~659--663), the server immediately checks \texttt{gs.phase != STATE\_LOBBY || gs.player\_count >= MAX\_PLAYERS}. If either condition holds, it sends \texttt{MSG\_ERROR} with an explanatory string and closes the new file descriptor (server.c, line~661--662), preventing any new socket from entering the \texttt{fd\_set}.
-
-\subsection*{5. \texttt{write} failures (broken pipe)}
-
-\textbf{What can go wrong:} A client disconnects between a \texttt{select} poll and a subsequent \texttt{write}, causing \texttt{write(2)} to return $-1$ with \texttt{EPIPE}.
-
-\textbf{How it is handled:} \texttt{write\_all} (server.c, lines~28--39) returns $-1$ if any \texttt{write} call fails. The \texttt{broadcast} function (server.c, lines~57--64) checks this return value for every connected player; if \texttt{write\_all} fails for a given slot, \texttt{disconnect\_player} is called immediately, closing the socket and setting \texttt{fd = -1} before iteration continues. Because \texttt{disconnect\_player} nulls the file descriptor before any recursive broadcast it may trigger (e.g.\ \texttt{MSG\_PLAYER\_ELIM} during resolution), the failing player is safely skipped in all subsequent writes. Unicast helpers (\texttt{send\_error}, \texttt{send\_wait}, etc.) similarly rely on \texttt{write\_all}'s return value; the caller always guards writes with a socket validity check.
-
-\subsection*{6. Action targeting a dead player}
-
-\textbf{What can go wrong:} A player submits \texttt{MSG\_ACTION} targeting the ID of a player who has just been eliminated.
-
-\textbf{How it is handled:} \texttt{game\_validate\_action} (game.c) checks that the target ID corresponds to a living player when the move requires an enemy target (\texttt{requires\_target == 1}). If the target is dead or out of range, the function writes a descriptive error string into the \texttt{err} buffer and returns $-1$; the server then sends this as \texttt{MSG\_ERROR} to the submitting player (server.c, lines~328--331), and the player must resubmit.
-
-\subsection*{7. \texttt{select} interrupted by a signal (EINTR)}
-
-\textbf{What can go wrong:} A Unix signal (e.g.\ \texttt{SIGCHLD}, \texttt{SIGPIPE}, or an OS-level delivery) interrupts the blocking \texttt{select(2)} call before any file descriptor becomes ready, causing it to return $-1$ with \texttt{errno == EINTR}. Treating this as a fatal error would crash the server or disconnect the client.
-
-\textbf{How it is handled:} Both the server (server.c, line~607) and the client (client.c, line~520) check for \texttt{EINTR} immediately after \texttt{select} returns a negative value:
-\begin{lstlisting}
-if (ready < 0) {
-    if (errno == EINTR) continue;
-    perror("select"); exit(1);
-}
-\end{lstlisting}
-On \texttt{EINTR} the loop simply restarts, re-building the \texttt{fd\_set} and calling \texttt{select} again. Any other negative return (a genuine system error) is treated as fatal and logged with \texttt{perror}.
-
-\subsection*{8. Unauthorised or premature \texttt{MSG\_START\_GAME}}
-
-\textbf{What can go wrong:} Three distinct violations can occur around the start-game flow: (a) a non-host player sends \texttt{MSG\_START\_GAME}; (b) the host sends it while at least one connected player has not yet selected a character; or (c) the host sends it when fewer than two players have joined.
-
-\textbf{How it is handled:} \texttt{handle\_start\_game} (server.c, lines~356--388) checks each condition in order and sends \texttt{MSG\_ERROR} with a specific message for each:
-\begin{itemize}[leftmargin=2em]
-    \item \textit{``Only the host can start.''} --- if \texttt{player\_id != gs->host\_id} (line~358--361). The connection is left open so the non-host player can continue participating.
-    \item \textit{``All players must select a character first.''} --- if any connected player's \texttt{char\_id < 0} (lines~371--377). The host must wait for everyone to pick before retrying.
-    \item \textit{``Need at least 2 players to start.''} --- if \texttt{ready < MIN\_PLAYERS} (lines~379--383). This prevents a solo game from accidentally starting.
-\end{itemize}
-In all three cases the game remains in \texttt{STATE\_LOBBY} and no state is mutated, so the host can correct the situation and re-send \texttt{MSG\_START\_GAME}.
-
-\subsection*{9. Client stdin EOF (user closes terminal input)}
-
-\textbf{What can go wrong:} The user presses \texttt{Ctrl-D} or pipes input that ends, causing \texttt{fgets} on \texttt{stdin} to return \texttt{NULL}. Without handling this, the client could spin forever on the \texttt{select} loop or attempt to send garbage to the server.
-
-\textbf{How it is handled:} Both input paths in the client check the return value of \texttt{fgets}. In the lobby handler (client.c, lines~355--358) and the in-game handler (client.c, lines~417--420), a \texttt{NULL} return immediately closes the socket and calls \texttt{exit(0)}:
-\begin{lstlisting}
-if (fgets(line, sizeof(line), stdin) == NULL) {
-    printf("EOF on stdin, disconnecting.\n");
-    close(sockfd);
-    exit(0);
-}
-\end{lstlisting}
-Closing the socket triggers a \texttt{read} return of 0 on the server side, which calls \texttt{disconnect\_player} and handles the departure just as any other disconnection.
-
-\subsection*{10. Player eliminated by status-effect tick before action collection}
-
-\textbf{What can go wrong:} At the start of each round, \texttt{begin\_round} calls \texttt{game\_tick\_effects} to apply ongoing status effects (e.g.\ poison damage). If a player's HP reaches zero during this tick, the round must end immediately rather than entering action collection with zero or one living player.
-
-\textbf{How it is handled:} After ticking effects, \texttt{begin\_round} (server.c, lines~456--470) calls \texttt{game\_check\_end} before transitioning to \texttt{STATE\_ACTION\_COLLECTION}. If the check returns non-zero (one or zero survivors), the server broadcasts any pending \texttt{MSG\_PLAYER\_ELIM} messages, sets \texttt{phase = STATE\_GAME\_OVER}, and sends \texttt{MSG\_GAME\_OVER} without ever opening the action-collection window. This prevents a round from starting in an already-resolved state and ensures the game always terminates cleanly even when poison or other damage-over-time effects deliver the killing blow between rounds.
 
 %% ============================================================
 \section{Team Contributions}
