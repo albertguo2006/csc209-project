@@ -425,29 +425,35 @@ The client also uses \texttt{select} (client.c) to multiplex between two readabl
 \begin{center}
 \begin{tabular}{@{}lcccc@{}}
 \toprule
-\textbf{Component} & \textbf{Member 1} & \textbf{Member 2} & \textbf{Member 3} \\
+\textbf{Component} & \textbf{Albert} & \textbf{Kaitlyn} & \textbf{Yibin} \\
 \midrule
-\texttt{protocol.h} --- message struct definitions & & & \\
-\texttt{game.h} --- data structure design & & & \\
-\texttt{game.c} --- character \& move definitions & & & \\
-\texttt{game.c} --- damage pipeline (\texttt{apply\_damage}) & & & \\
-\texttt{game.c} --- status effect system & & & \\
-\texttt{game.c} --- action resolution \& sorting & & & \\
-\texttt{game.c} --- type effectiveness matrix & & & \\
-\texttt{server.c} --- TCP setup \& accept loop & & & \\
-\texttt{server.c} --- \texttt{select} event loop \& timer logic & & & \\
-\texttt{server.c} --- message handlers & & & \\
-\texttt{server.c} --- resolution drip-feed logic & & & \\
-\texttt{server.c} --- disconnect \& error handling & & & \\
-\texttt{client.c} --- socket connection \& send logic & & & \\
-\texttt{client.c} --- message receive \& dispatch & & & \\
-\texttt{client.c} --- terminal UI (HP bars, ANSI) & & & \\
-\texttt{client.c} --- typewriter effect \& timer display & & & \\
-\texttt{Makefile} --- build system & & & \\
-Project documentation (this report) & & & \\
-Demo video & & & \\
+\texttt{protocol.h} --- message struct definitions & $\bullet$ & & \\
+\texttt{game.h} --- data structure design & $\bullet$ & & $\bullet$ \\
+\texttt{game.c} --- character \& move definitions & & & $\bullet$ \\
+\texttt{game.c} --- damage pipeline (\texttt{apply\_damage}) & $\bullet$ & & \\
+\texttt{game.c} --- status effect system & $\bullet$ & & $\bullet$ \\
+\texttt{game.c} --- action resolution \& sorting & $\bullet$ & & \\
+\texttt{game.c} --- type effectiveness matrix & & & $\bullet$ \\
+\texttt{server.c} --- TCP setup \& accept loop & $\bullet$ & & \\
+\texttt{server.c} --- \texttt{select} event loop \& timer logic & $\bullet$ & & \\
+\texttt{server.c} --- message handlers & $\bullet$ & & \\
+\texttt{server.c} --- resolution drip-feed logic & $\bullet$ & & \\
+\texttt{server.c} --- disconnect \& error handling & $\bullet$ & $\bullet$ & \\
+\texttt{client.c} --- socket connection \& send logic & $\bullet$ & & \\
+\texttt{client.c} --- message receive \& dispatch & $\bullet$ & & \\
+\texttt{client.c} --- terminal UI (HP bars, ANSI) & $\bullet$ & & \\
+\texttt{client.c} --- typewriter effect \& timer display & $\bullet$ & & \\
+\texttt{Makefile} --- build system & $\bullet$ & & \\
+Project documentation (this report) & & $\bullet$ & $\bullet$ \\
+Demo video & & $\bullet$ & \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\textbf{Albert Guo} designed and implemented the core client--server architecture, including the TCP socket setup, the \texttt{select}-based event loop, the binary communication protocol (\texttt{protocol.h}), and all message handlers on both the server and client sides. He also built the game engine's damage pipeline, action resolution and sorting logic, the status effect system, and the full client terminal UI (HP bars, ANSI colouring, typewriter effect, timer display). He wrote the \texttt{Makefile} and contributed to the server-side disconnect and error handling.
+
+\textbf{Kaitlyn Zhu} focused on error handling and robustness across the codebase, including the server-side disconnect logic, write-failure recovery in \texttt{broadcast} and unicast helpers, and validation of edge cases such as unknown opcodes and mid-game disconnections. She was the primary author of this project report and produced and edited the demo video.
+
+\textbf{Yibin Wang} designed and implemented the game content: the eight playable characters, their four unique moves each (32 abilities total), the five-type effectiveness matrix, and the character class system. He also contributed to the data structure design in \texttt{game.h} and the status effect system in \texttt{game.c}, and helped write sections of this report.
 
 \end{document}

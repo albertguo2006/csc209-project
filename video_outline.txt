@@ -1,0 +1,69 @@
+TermiNuke Battle Arena - Demo Video Script Outline
+=====================================================
+Total target length: ~3 minutes
+
+OPENING (~10 seconds)
+---------------------
+- Screen shot or text file showing:
+  - MarkUs group name
+  - Team members: Albert Guo, Kaitlyn Zhu, Yibin Wang
+
+PART 1 - Feature Demo (~1.5 minutes)
+-------------------------------------
+Feature to demonstrate: Real-time multiplayer combat over TCP sockets
+
+Setup (show two terminal windows side by side):
+  1. Start the server:  ./server
+  2. Connect client 1:  ./client 127.0.0.1 4242
+  3. Connect client 2:  ./client 127.0.0.1 4242
+
+Lobby walkthrough:
+  - Both players enter names
+  - Show the character roster appearing (MSG_CHAR_LIST broadcast)
+  - Each player picks a character with "pick <id>"
+  - Point out the lobby update appearing on both clients simultaneously
+  - Host types "start" to begin the game
+
+Gameplay walkthrough (one round):
+  - Show the round start with HP bars and the 30-second countdown timer
+  - Both players submit actions (e.g. "0" or "2 1")
+  - Show the MSG_WAIT acknowledgement appearing
+  - Watch the resolution phase: narrative events drip-feed every 2 seconds
+    with the typewriter effect
+  - Point out HP bars updating at the next round start
+
+Key thing to emphasize: both clients receive the same events in real time
+through the server's TCP broadcast -- this is sockets in action.
+
+PART 2 - Code Walkthrough (~1.5 minutes)
+-----------------------------------------
+Focus: How the server uses select() to handle multiple clients over TCP
+
+1. Server socket setup (server.c, ~line 568-586):
+   - Show socket(), setsockopt(), bind(), listen() sequence
+   - "The server opens a TCP socket on port 4242 and listens for connections"
+
+2. The select() event loop (server.c, ~line 594-630):
+   - Show how fd_set is rebuilt each iteration: listen socket + all player fds
+   - Explain the timeout logic: 1-second ticks during action collection,
+     2-second delays during resolution, NULL (blocking) in lobby
+   - "select() lets us monitor all connections at once without blocking
+     on any single client"
+
+3. Message flow for one action (server.c, handle_action ~line 325):
+   - Client sends MSG_ACTION (4 bytes: opcode, action_id, target_id, padding)
+   - Server validates the action via game_validate_action
+   - Server sends back MSG_WAIT to confirm
+   - Once all actions are in, server resolves combat and broadcasts
+     MSG_ROUND_EVENT to every client
+   - "All messages are fixed-size binary structs defined in protocol.h --
+     the opcode byte tells both sides exactly how many bytes to read"
+
+4. Briefly mention broadcast function (server.c, ~line 58-66):
+   - Loops over all player slots, calls write_all for each connected player
+   - If write fails, disconnects that player without affecting others
+   - "This is how every client sees the same game events in real time"
+
+CLOSING
+-------
+- No summary needed -- end after the code walkthrough
