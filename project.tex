@@ -169,7 +169,7 @@ The diagram below shows the server process, up to eight client processes, the TC
     ([xshift=5pt]c4.north) -- ([xshift=0pt]srv.south east);
 
 \draw[arrow, color=blue!70!black]
-    ([xshift=-8pt]srv.south east) -- ([xshift=-3pt]c4.north)
+    ([xshift=-8pt]srv.south east) -- ([xshift=-3pt]c4.north);
 
 %% --- Legend ---
 \node[draw=gray, fill=gray!5, rounded corners, font=\tiny, align=left,
@@ -195,7 +195,7 @@ All messages are \textbf{fixed-width binary structs} defined in \texttt{protocol
 
 \begingroup
 \small
-\begin{longtable}{@{}p{2.0cm} p{1.2cm} p{2.4cm} p{3.2cm} p{4.6cm}@{}}
+\begin{longtable}{@{}p{1.8cm} p{1.2cm} p{2.4cm} p{4.2cm} p{4.8cm}@{}}
 \toprule
 \textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} & \textbf{Error Handling} \\
 \midrule\endhead
@@ -238,7 +238,7 @@ Sent during \texttt{STATE\_LOBBY} to claim character slot 0--7. On success, \tex
 
 \begingroup
 \small
-\begin{longtable}{@{}p{2.0cm} p{1.2cm} p{2.4cm} p{3.0cm} p{4.8cm}@{}}
+\begin{longtable}{@{}p{1.8cm} p{1.2cm} p{2.4cm} p{4.2cm} p{4.8cm}@{}}
 \toprule
 \textbf{Message / Opcode} & \textbf{Size} & \textbf{Encoding} & \textbf{Semantics \& Invariants} & \textbf{Error Handling} \\
 \midrule\endhead
