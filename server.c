@@ -93,14 +93,14 @@ static void send_lobby_update(GameState *gs)
     broadcast(gs, &m, sizeof(m));
 }
 
-static void send_char_list(GameState *gs, int fd)
+static int send_char_list(GameState *gs, int fd)
 {
     CharListMsg m;
     memset(&m, 0, sizeof(m));
     m.msg_type   = MSG_CHAR_LIST;
     m.char_count = NUM_CHARACTERS;
     game_build_char_list(gs, m.chars);
-    write_all(fd, &m, sizeof(m));
+    return write_all(fd, &m, sizeof(m));
 }
 
 static void send_game_start(GameState *gs)
@@ -120,7 +120,8 @@ static void send_game_start(GameState *gs)
         m.action_count = (uint8_t)act_count;
 
         fill_player_info(gs, m.players);
-        write_all(p->fd, &m, sizeof(m));
+        if (write_all(p->fd, &m, sizeof(m)) < 0)
+            disconnect_player(gs, i);
     }
 }
 
@@ -155,13 +156,13 @@ static void send_round_event(GameState *gs, const char *text)
     broadcast(gs, &m, sizeof(m));
 }
 
-static void send_status_update(int fd, const char *text)
+static int send_status_update(int fd, const char *text)
 {
     StatusUpdateMsg m;
     memset(&m, 0, sizeof(m));
     m.msg_type = MSG_STATUS_UPDATE;
     strncpy(m.text, text, STATUS_TEXT_LEN - 1);
-    write_all(fd, &m, sizeof(m));
+    return write_all(fd, &m, sizeof(m));
 }
 
 static void send_player_elim(GameState *gs, int player_id)
@@ -186,31 +187,31 @@ static void send_game_over(GameState *gs, int is_tie, int winner_id)
     broadcast(gs, &m, sizeof(m));
 }
 
-static void send_error(int fd, const char *msg)
+static int send_error(int fd, const char *msg)
 {
     ErrorMsg m;
     memset(&m, 0, sizeof(m));
     m.msg_type = MSG_ERROR;
     strncpy(m.message, msg, sizeof(m.message) - 1);
-    write_all(fd, &m, sizeof(m));
+    return write_all(fd, &m, sizeof(m));
 }
 
-static void send_wait(int fd)
+static int send_wait(int fd)
 {
     WaitMsg m;
     memset(&m, 0, sizeof(m));
     m.msg_type = MSG_WAIT;
-    write_all(fd, &m, sizeof(m));
+    return write_all(fd, &m, sizeof(m));
 }
 
-static void send_join_ack(int fd, int your_id, int is_host)
+static int send_join_ack(int fd, int your_id, int is_host)
 {
     JoinAckMsg m;
     m.msg_type = MSG_JOIN_ACK;
     m.your_id  = (uint8_t)your_id;
     m.is_host  = (uint8_t)is_host;
     m.padding  = 0;
-    write_all(fd, &m, sizeof(m));
+    return write_all(fd, &m, sizeof(m));
 }
 
 /* =========================================================================
@@ -271,8 +272,14 @@ static void handle_join(GameState *gs, int fd, const JoinMsg *msg)
 
     printf("[server] Player %d joined: %s%s\n", id, name,
            id == gs->host_id ? " (host)" : "");
-    send_join_ack(fd, id, id == gs->host_id);
-    send_char_list(gs, fd);
+    if (send_join_ack(fd, id, id == gs->host_id) < 0) {
+        disconnect_player(gs, id);
+        return;
+    }
+    if (send_char_list(gs, fd) < 0) {
+        disconnect_player(gs, id);
+        return;
+    }
     send_lobby_update(gs);
 }
 
@@ -287,12 +294,14 @@ static void handle_char_select(GameState *gs, int player_id,
     int cid = msg->char_id;
 
     if (gs->phase != STATE_LOBBY) {
-        send_error(p->fd, "Can't change character now.");
+        if (send_error(p->fd, "Can't change character now.") < 0)
+            disconnect_player(gs, player_id);
         return;
     }
 
     if (game_assign_character(gs, player_id, cid) < 0) {
-        send_error(p->fd, "Character unavailable or invalid.");
+        if (send_error(p->fd, "Character unavailable or invalid.") < 0)
+            disconnect_player(gs, player_id);
         return;
     }
 
@@ -302,8 +311,10 @@ static void handle_char_select(GameState *gs, int player_id,
     /* Broadcast updated lobby and send updated char list to all */
     send_lobby_update(gs);
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (gs->players[i].fd != -1)
-            send_char_list(gs, gs->players[i].fd);
+        if (gs->players[i].fd != -1) {
+            if (send_char_list(gs, gs->players[i].fd) < 0)
+                disconnect_player(gs, i);
+        }
     }
 }
 
@@ -316,11 +327,13 @@ static void handle_action(GameState *gs, int player_id, const ActionMsg *msg)
     Player *p = &gs->players[player_id];
 
     if (gs->phase != STATE_ACTION_COLLECTION) {
-        send_error(p->fd, "Not currently accepting actions.");
+        if (send_error(p->fd, "Not currently accepting actions.") < 0)
+            disconnect_player(gs, player_id);
         return;
     }
     if (p->pending_action_id != -1) {
-        send_error(p->fd, "You already submitted an action this round.");
+        if (send_error(p->fd, "You already submitted an action this round.") < 0)
+            disconnect_player(gs, player_id);
         return;
     }
 
@@ -329,7 +342,8 @@ static void handle_action(GameState *gs, int player_id, const ActionMsg *msg)
 
     char err[64];
     if (game_validate_action(gs, player_id, aid, tid, err, sizeof(err)) < 0) {
-        send_error(p->fd, err);
+        if (send_error(p->fd, err) < 0)
+            disconnect_player(gs, player_id);
         return;
     }
 
@@ -344,7 +358,8 @@ static void handle_action(GameState *gs, int player_id, const ActionMsg *msg)
     p->pending_action_id = aid;
     p->pending_target_id = (req > 0) ? tid : NO_TARGET;
 
-    send_wait(p->fd);
+    if (send_wait(p->fd) < 0)
+        disconnect_player(gs, player_id);
     printf("[server] Player %d (%s) chose action %d target %d\n",
            player_id, p->name, aid, p->pending_target_id);
 }
@@ -356,11 +371,13 @@ static void handle_action(GameState *gs, int player_id, const ActionMsg *msg)
 static void handle_start_game(GameState *gs, int player_id)
 {
     if (player_id != gs->host_id) {
-        send_error(gs->players[player_id].fd, "Only the host can start.");
+        if (send_error(gs->players[player_id].fd, "Only the host can start.") < 0)
+            disconnect_player(gs, player_id);
         return;
     }
     if (gs->phase != STATE_LOBBY) {
-        send_error(gs->players[player_id].fd, "Game already started.");
+        if (send_error(gs->players[player_id].fd, "Game already started.") < 0)
+            disconnect_player(gs, player_id);
         return;
     }
 
@@ -369,16 +386,18 @@ static void handle_start_game(GameState *gs, int player_id)
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (gs->players[i].fd != -1 && gs->players[i].name[0] != '\0') {
             if (gs->players[i].char_id < 0) {
-                send_error(gs->players[player_id].fd,
-                           "All players must select a character first.");
+                if (send_error(gs->players[player_id].fd,
+                           "All players must select a character first.") < 0)
+                    disconnect_player(gs, player_id);
                 return;
             }
             ready++;
         }
     }
     if (ready < MIN_PLAYERS) {
-        send_error(gs->players[player_id].fd,
-                   "Need at least 2 players to start.");
+        if (send_error(gs->players[player_id].fd,
+                   "Need at least 2 players to start.") < 0)
+            disconnect_player(gs, player_id);
         return;
     }
 
@@ -482,7 +501,8 @@ static void begin_round(GameState *gs)
         if (p->alive && p->fd != -1) {
             char status_text[STATUS_TEXT_LEN];
             game_build_status_text(gs, i, status_text, sizeof(status_text));
-            send_status_update(p->fd, status_text);
+            if (send_status_update(p->fd, status_text) < 0)
+                disconnect_player(gs, i);
         }
     }
 }
@@ -549,7 +569,10 @@ int main(void)
     if (listen_fd < 0) { perror("socket"); exit(1); }
 
     int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        exit(1);
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
