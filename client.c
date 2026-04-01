@@ -204,12 +204,11 @@ static void on_timer_tick(const TimerTickMsg *m)
 {
     if (waiting_for_result) {
         clear_line();
-        printf("Time remaining: %2ds | Waiting for other players...",
-               m->seconds_left);
+        printf("Time remaining: %2ds | Waiting for other players...", m->seconds_left);
     } else if (timer_line_displayed) {
-        printf("\033[s\033[A\r\033[K");
+        printf("\0337\033[A\r\033[K"); 
         printf("Time remaining: %2ds", m->seconds_left);
-        printf("\033[u");
+        printf("\0338"); 
     } else {
         clear_line();
         printf("Time remaining: %2ds", m->seconds_left);
