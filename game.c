@@ -40,14 +40,14 @@ static const CharacterDef char_defs[NUM_CHARACTERS] = {
         { "Stab",           "Inflict 30 damage",                             1, 0, 0 },
         { "CR/NCR",         "Invulnerable 1 turn (no back-to-back)",         0, 1, 0 },
         { "Drug Mixing",    "Random: 40 dmg / skip turn / poison / nothing", 1, 0, 0 },
-        { "Pizza & Fries",  "Damage = ceil(2.25 x target speed)",            1, 0, 0 },
+        { "Pizza & Fries",  "Damage = ceil(2.25 * target speed)",	     1, 0, 0 }, 
     }},
     /* 2: Yibin Wang */
-    { "Yibin Wang", TYPE_STUDENT, 100, 12, 3, {
+    { "Yibin Wang", TYPE_STUDENT, 100, 12, 4, {
         { "Undef Behaviour",  "Moderate dmg, scramble target next move",     1, 0, 0 },
-        { "Dangling Pointer", "Target next attack misses, 50% redirect",     1, 0, 0 },
-        { "Null Dereference", "Execute if target <25% HP, else 20 dmg",      1, 0, 0 },
-        { "", "", 0, 0, 0 },
+        { "Post-Meal Glow", "Heal 25 HP and clear all current debuffs",      0, 0, 0 },
+        { "Overanalysis", "Target misses next attack, speed dec by 20%",     1, 0, 0 },
+        { "The Chinese Room", "Massive dmg, ignores immunity, but stuns self", 1, 0, 0 },
     }},
     /* 3: Doug Ford */
     { "Doug Ford", TYPE_POLITICIAN, 150, 5, 4, {
@@ -99,8 +99,9 @@ static void move_crncr(Player *a, Player *t, GameState *gs, char *n, int nl);
 static void move_drug_mixing(Player *a, Player *t, GameState *gs, char *n, int nl);
 static void move_pizza_fries(Player *a, Player *t, GameState *gs, char *n, int nl);
 static void move_undef_behaviour(Player *a, Player *t, GameState *gs, char *n, int nl);
-static void move_dangling_pointer(Player *a, Player *t, GameState *gs, char *n, int nl);
-static void move_null_deref(Player *a, Player *t, GameState *gs, char *n, int nl);
+static void move_post_meal_glow(Player *a, Player *t, GameState *gs, char *n, int nl);
+static void move_overanalysis(Player *a, Player *t, GameState *gs, char *n, int nl);
+static void move_chinese_room(Player *a, Player *t, GameState *gs, char *n, int nl);
 static void move_osap_cuts(Player *a, Player *t, GameState *gs, char *n, int nl);
 static void move_notwithstanding(Player *a, Player *t, GameState *gs, char *n, int nl);
 static void move_filibuster(Player *a, Player *t, GameState *gs, char *n, int nl);
@@ -126,7 +127,7 @@ static void move_man_page_reading(Player *a, Player *t, GameState *gs, char *n, 
 static MoveFn move_fns[NUM_CHARACTERS][MOVES_PER_CHAR] = {
     { move_gradient_descent, move_bioinformatics, move_overfit_model, move_data_pipeline },
     { move_stab, move_crncr, move_drug_mixing, move_pizza_fries },
-    { move_undef_behaviour, move_dangling_pointer, move_null_deref, NULL },
+    { move_undef_behaviour, move_post_meal_glow, move_overanalysis, move_chinese_room},
     { move_osap_cuts, move_notwithstanding, move_filibuster, move_buck_a_beer },
     { move_planned_trackwork, move_shuttle_buses, move_fare_inspector, move_slow_zone },
     { move_deduct_marks, move_check_syllabus, move_extension_denied, move_office_hours },
@@ -370,7 +371,7 @@ static void move_gradient_descent(Player *a, Player *t, GameState *gs,
 {
     narr_append(n, nl, "%s used Gradient Descent! ", a->name);
     int dmg = apply_damage(a, t, gs, 25, DMG_HAS_SPECIAL, n, nl);
-    if (dmg > 0 && t && t->alive && t->status.status_immune_turns <= 0) {
+    if (dmg > 0 && t && t->alive && t->hp > 0 && t->status.status_immune_turns <= 0) {
         t->status.attack_debuff_pct += 10;
         if (t->status.attack_debuff_pct > 100) t->status.attack_debuff_pct = 100;
         narr_append(n, nl, " %s's attack reduced by 10%%!", t->name);
@@ -486,47 +487,67 @@ static void move_undef_behaviour(Player *a, Player *t, GameState *gs,
 {
     narr_append(n, nl, "%s used Undefined Behaviour! ", a->name);
     int dmg = apply_damage(a, t, gs, 25, DMG_HAS_SPECIAL, n, nl);
-    if (dmg > 0 && t && t->alive && t->status.status_immune_turns <= 0) {
+    if (dmg > 0 && t && t->alive && t->hp > 0 && t->status.status_immune_turns <= 0) {
         t->status.scrambled = 1;
         narr_append(n, nl, " %s's next move will be random!", t->name);
     }
 }
 
-static void move_dangling_pointer(Player *a, Player *t, GameState *gs,
-                                  char *n, int nl)
+static void move_post_meal_glow(Player *a, Player *t, GameState *gs, 
+				 char *n, int nl)
+{
+    (void)t;
+    (void)gs;
+    narr_append(n, nl, "%s feels rejuvenated after a great meal! Heal 25 HP.", a->name);
+    apply_healing(a, 25, n, nl);
+
+    /* Clear all debuffs */
+    a->status.attack_debuff_pct = 0;
+    a->status.poison_turns = 0;
+    a->status.poison_damage = 0;
+    a->status.scrambled = 0;
+    a->status.forced_miss = 0;
+    a->status.speed_reduction_pct = 0;
+    a->status.healing_reduction_pct = 0;
+    a->status.healing_reduction_turns = 0;
+    a->status.healing_blocked_turns = 0;
+    a->status.defense_debuff_pct = 0;
+
+    narr_append(n, nl, " All debuffs were cleared!");
+}
+
+static void move_overanalysis(Player *a, Player *t, GameState *gs,
+                               char *n, int nl)
 {
     (void)gs;
-    narr_append(n, nl, "%s used Dangling Pointer on %s! ",
-                a->name, (t && t->alive) ? t->name : "nobody");
+    narr_append(n, nl, "%s is overanalyzing %s! ", a->name, (t && t->alive) ? t->name : "nobody");
     if (!t || !t->alive) return;
+
     if (t->status.status_immune_turns <= 0) {
+        /* Set forced miss and reduce speed */
         t->status.forced_miss = 1;
-        narr_append(n, nl, "%s's next attack will miss!", t->name);
+        t->status.speed_reduction_pct += 20;
+        if (t->status.speed_reduction_pct > 90) t->status.speed_reduction_pct = 90;
+        
+        narr_append(n, nl, "%s's next attack will miss and speed is reduced by 20%%!", t->name);
     } else {
-        narr_append(n, nl, "But %s is immune!", t->name);
+        narr_append(n, nl, "But %s's mind is a closed book!", t->name);
     }
 }
 
-static void move_null_deref(Player *a, Player *t, GameState *gs,
-                            char *n, int nl)
+static void move_chinese_room(Player *a, Player *t, GameState *gs,
+                               char *n, int nl)
 {
-    narr_append(n, nl, "%s used Null Dereference on %s! ",
-                a->name, (t && t->alive) ? t->name : "nobody");
+    narr_append(n, nl, "%s invokes The Chinese Room! ", a->name);
     if (!t || !t->alive) return;
 
-    if (t->hp > 0 && t->hp <= t->max_hp / 4) {
-        narr_append(n, nl, "SEGFAULT! ");
-        if (t->status.invulnerable) {
-            narr_append(n, nl, "%s is invulnerable! Execution failed!", t->name);
-        } else if (t->status.divine_mark) {
-            t->hp = 1;
-            narr_append(n, nl, "Divine Intervention saves %s at 1 HP!", t->name);
-        } else {
-            t->hp = 0;
-            narr_append(n, nl, "%s was executed! Eliminated!", t->name);
-        }
-    } else {
-        apply_damage(a, t, gs, 20, 0, n, nl);
+    /* Massive damage that ignores type and standard blocks.*/
+    int dmg = apply_damage(a, t, gs, 50, DMG_UNBLOCKABLE | DMG_IGNORE_TYPE, n, nl);
+
+    /* Stun */
+    if (dmg > 0) {
+        narr_append(n, nl, " Syntax without semantics! %s is exhausted.", a->name);
+	a->status.skip_next_turn = 1;
     }
 }
 
@@ -598,7 +619,7 @@ static void move_fare_inspector(Player *a, Player *t, GameState *gs,
     int base = t->hp * 20 / 100;
     if (base < 1) base = 1;
     int dmg = apply_damage(a, t, gs, base, DMG_HAS_SPECIAL | DMG_IGNORE_TYPE, n, nl);
-    if (dmg > 0 && t->alive && t->status.status_immune_turns <= 0) {
+    if (dmg > 0 && t->alive && t->hp > 0 && t->status.status_immune_turns <= 0) {
         t->status.healing_blocked_turns = 1;
         narr_append(n, nl, " %s can't heal next turn!", t->name);
     }
@@ -629,7 +650,7 @@ static void move_deduct_marks(Player *a, Player *t, GameState *gs,
 {
     narr_append(n, nl, "%s used Deduct Marks! ", a->name);
     int dmg = apply_damage(a, t, gs, 25, DMG_BYPASS_BUFFS | DMG_HAS_SPECIAL, n, nl);
-    if (dmg > 0 && t && t->alive && t->status.status_immune_turns <= 0) {
+    if (dmg > 0 && t && t->alive && t->hp > 0 && t->status.status_immune_turns <= 0) {
         t->status.healing_reduction_pct = 50;
         t->status.healing_reduction_turns = 2;
         narr_append(n, nl, " %s's healing halved for 2 turns!", t->name);
@@ -981,7 +1002,7 @@ int game_resolve_round(GameState *gs)
         int pidx = slots[s].player_idx;
         Player *p = &gs->players[pidx];
 
-        if (!p->alive) continue;
+        if (!p->alive || p->hp <= 0) continue;
 
         int mid = p->pending_action_id;
         char *narr = gs->resolve_events[event_count];
@@ -1102,6 +1123,14 @@ void game_init(GameState *gs)
     gs->host_id = -1;
 
     memset(gs->char_taken, 0, sizeof(gs->char_taken));
+
+    for (int s = 0; s < MAX_SPECTATORS; s++) {
+        gs->spectators[s].fd = -1;
+        gs->spectators[s].rbuf_len = 0;
+        gs->spectators[s].wbuf_len = 0;
+        memset(gs->spectators[s].name, 0, PLAYER_NAME_LEN);
+    }
+    gs->spectator_count = 0;
 }
 
 /* =========================================================================
@@ -1174,12 +1203,20 @@ void game_remove_player(GameState *gs, int player_id)
     if (p->char_id >= 0 && p->char_id < NUM_CHARACTERS)
         gs->char_taken[p->char_id] = 0;
 
+    // MODIFIED: Decrease alive_count if player quits game
+    if (p->alive) {
+    	gs->alive_count--;
+    }
+
     p->fd = -1;
     p->alive = 0;
     p->hp = 0;
     p->char_id = -1;
+    memset(p->name, 0, PLAYER_NAME_LEN);
+
+    // Decrease num of total players in the room
     gs->player_count--;
-    gs->alive_count--;
+    // gs->alive_count--;
 }
 
 /* =========================================================================
@@ -1476,14 +1513,14 @@ int game_validate_action(const GameState *gs, int player_id, int action_id,
         /* Must target alive enemy */
         if (target_id == NO_TARGET || target_id >= MAX_PLAYERS
             || !gs->players[target_id].alive || target_id == player_id) {
-            snprintf(err, err_len, "Must target an alive opponent.");
+            snprintf(err, err_len, "You can't use this on yourself!");
             return -1;
         }
     } else if (req == 2) {
         /* Must target any alive player (including self) */
         if (target_id == NO_TARGET || target_id >= MAX_PLAYERS
             || !gs->players[target_id].alive) {
-            snprintf(err, err_len, "Must target an alive player.");
+            snprintf(err, err_len, "Invalid target. Are you sure that's the right player?");
             return -1;
         }
     }

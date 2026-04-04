@@ -33,9 +33,13 @@ static int need_prompt        = 0;
 static int game_over          = 0;
 static int am_host            = 0;
 static int my_lobby_id        = -1;
+static int my_room_id         = -1;
 static int in_resolution      = 0;  /* 1 while watching round events */
 static int char_selected      = 0;  /* 1 if character picked */
 static int timer_line_displayed = 0;
+static int in_room_select     = 1;  /* 1 on first connect; cleared when joining a room */
+static int is_spectator       = 0;  /* 1 while watching a game in progress */
+static char my_name[PLAYER_NAME_LEN]; /* stored before sending to server */
 
 /* =========================================================================
  * Utility
@@ -90,8 +94,26 @@ static void typewriter_print(const char *text)
 
 static void on_lobby_update(const LobbyUpdateMsg *m)
 {
-    printf("\n\033[1m=== Lobby (%d player%s) ===\033[0m\n",
-           m->player_count, m->player_count == 1 ? "" : "s");
+    // Reset game when returning to lobby
+    game_over = 0;
+    waiting_for_result = 0;
+    in_resolution = 0;
+    my_id = -1;
+    am_host = (m->host_id == (uint8_t)my_lobby_id);
+
+    /* Derive char_selected from the lobby data */
+    char_selected = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (m->players[i].player_id == (uint8_t)my_lobby_id
+            && m->players[i].name[0] != '\0'
+            && m->players[i].char_id != NO_CHARACTER) {
+            char_selected = 1;
+            break;
+        }
+    }
+
+    printf("\n\033[1m=== Lobby (Room %d, %d player%s) ===\033[0m\n",
+           my_room_id, m->player_count, m->player_count == 1 ? "" : "s");
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (m->players[i].name[0] == '\0') continue;
         printf("  [%d] %-20s", m->players[i].player_id, m->players[i].name);
@@ -112,10 +134,60 @@ static void on_lobby_update(const LobbyUpdateMsg *m)
     fflush(stdout);
 }
 
+static void on_room_list(const RoomListMsg *m)
+{
+    in_room_select = 1;
+    printf("\n\033[1m=== Room Selection ===\033[0m\n");
+    printf("  %-4s  %-9s  %-14s  %s\n",
+           "Room", "Players", "Status", "Spectators");
+    printf("  %-4s  %-9s  %-14s  %s\n",
+           "----", "-------", "------", "----------");
+    for (int i = 0; i < m->room_count; i++) {
+        const RoomInfo *r = &m->rooms[i];
+        if (r->player_count == 0 && r->spectator_count == 0) continue;
+        const char *status = (r->phase == 0) ? "Lobby" : "In Progress";
+        printf("  %-4d  %d/%-7d  %-14s  %d watching\n",
+               r->room_id, r->player_count, MAX_PLAYERS,
+               status, r->spectator_count);
+    }
+    printf("\nCommands:\n");
+    printf("  join <room_id>  -- join a room (spectate if game is in progress)\n");
+    printf("  new             -- join an empty room\n");
+    printf("> ");
+    fflush(stdout);
+}
+
+static void on_spectate_start(const SpectateStartMsg *m)
+{
+    is_spectator   = 1;
+    in_room_select = 0;
+    printf("\n\033[1m=== SPECTATING ===\033[0m\n");
+    printf("Game in progress (Round %d) — you will join the lobby when it ends.\n",
+           m->round_num);
+    printf("Current players:\n");
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (m->players[i].name[0] == '\0') continue;
+        printf("  [%d] %-20s [%s] ",
+               m->players[i].player_id,
+               m->players[i].name,
+               CHAR_TYPE_NAMES[m->players[i].char_type]);
+        if (m->players[i].alive)
+            print_hp_bar(m->players[i].hp, m->players[i].max_hp);
+        else
+            printf("ELIMINATED");
+        printf("\n");
+    }
+    printf("\n\033[33mYou are spectating. Watching the action...\033[0m\n");
+    fflush(stdout);
+}
+
 static void on_join_ack(const JoinAckMsg *m)
 {
-    my_lobby_id = m->your_id;
-    am_host     = m->is_host;
+    my_lobby_id    = m->your_id;
+    am_host        = m->is_host;
+    my_room_id     = m->room_id;
+    in_room_select = 0;
+    is_spectator   = 0;
     if (am_host)
         printf("You are the host.\n");
     fflush(stdout);
@@ -139,7 +211,12 @@ static void on_char_list(const CharListMsg *m)
                    c->moves[j].desc);
         }
     }
-    printf("\nType 'pick <number>' to select a character.\n");
+    if (!char_selected)
+        printf("\nType 'pick <number>' to select a character.\n");
+    if (am_host)
+        printf("Type 'start' when everyone is ready.\n");
+    else if (char_selected)
+        printf("Waiting for the host to start...\n");
     fflush(stdout);
 }
 
@@ -181,8 +258,8 @@ static void on_round_start(const RoundStartMsg *m)
 {
     waiting_for_result = 0;
     in_resolution = 0;
-    need_prompt = 1;
-    timer_line_displayed = 0;
+    need_prompt = is_spectator ? 0 : 1; /* spectators don't submit actions */
+    timer_line_displayed = 0; // Resets so the first tick doesn't move up
 
     printf("\n\033[1m--- Round %d ---\033[0m  (timer: %ds)\n",
            m->round_num, m->timer_secs);
@@ -200,8 +277,12 @@ static void on_round_start(const RoundStartMsg *m)
     fflush(stdout);
 }
 
+
 static void on_timer_tick(const TimerTickMsg *m)
 {
+    // Timer function
+    if (in_resolution) return;
+
     if (waiting_for_result) {
         clear_line();
         printf("Time remaining: %2ds | Waiting for other players...", m->seconds_left);
@@ -214,6 +295,8 @@ static void on_timer_tick(const TimerTickMsg *m)
         printf("Time remaining: %2ds", m->seconds_left);
     }
     fflush(stdout);
+
+
 }
 
 static void on_round_event(const RoundEventMsg *m)
@@ -281,18 +364,20 @@ static int process_server_buffer(void)
         size_t needed = 0;
 
         switch (opcode) {
-        case MSG_LOBBY_UPDATE:  needed = sizeof(LobbyUpdateMsg);  break;
-        case MSG_JOIN_ACK:      needed = sizeof(JoinAckMsg);      break;
-        case MSG_GAME_START:    needed = sizeof(GameStartMsg);    break;
-        case MSG_ROUND_START:   needed = sizeof(RoundStartMsg);   break;
-        case MSG_TIMER_TICK:    needed = sizeof(TimerTickMsg);    break;
-        case MSG_ROUND_EVENT:   needed = sizeof(RoundEventMsg);   break;
-        case MSG_PLAYER_ELIM:   needed = sizeof(PlayerElimMsg);   break;
-        case MSG_GAME_OVER:     needed = sizeof(GameOverMsg);     break;
-        case MSG_ERROR:         needed = sizeof(ErrorMsg);        break;
-        case MSG_WAIT:          needed = sizeof(WaitMsg);         break;
-        case MSG_CHAR_LIST:     needed = sizeof(CharListMsg);     break;
-        case MSG_STATUS_UPDATE: needed = sizeof(StatusUpdateMsg); break;
+        case MSG_LOBBY_UPDATE:   needed = sizeof(LobbyUpdateMsg);   break;
+        case MSG_JOIN_ACK:       needed = sizeof(JoinAckMsg);       break;
+        case MSG_GAME_START:     needed = sizeof(GameStartMsg);     break;
+        case MSG_ROUND_START:    needed = sizeof(RoundStartMsg);    break;
+        case MSG_TIMER_TICK:     needed = sizeof(TimerTickMsg);     break;
+        case MSG_ROUND_EVENT:    needed = sizeof(RoundEventMsg);    break;
+        case MSG_PLAYER_ELIM:    needed = sizeof(PlayerElimMsg);    break;
+        case MSG_GAME_OVER:      needed = sizeof(GameOverMsg);      break;
+        case MSG_ERROR:          needed = sizeof(ErrorMsg);         break;
+        case MSG_WAIT:           needed = sizeof(WaitMsg);          break;
+        case MSG_CHAR_LIST:      needed = sizeof(CharListMsg);      break;
+        case MSG_STATUS_UPDATE:  needed = sizeof(StatusUpdateMsg);  break;
+        case MSG_ROOM_LIST:      needed = sizeof(RoomListMsg);      break;
+        case MSG_SPECTATE_START: needed = sizeof(SpectateStartMsg); break;
         default:
             fprintf(stderr, "Unknown opcode 0x%02x from server\n", opcode);
             return -1;
@@ -301,18 +386,20 @@ static int process_server_buffer(void)
         if ((size_t)rbuf_len < needed) break;
 
         switch (opcode) {
-        case MSG_LOBBY_UPDATE:  on_lobby_update((const LobbyUpdateMsg *)rbuf); break;
-        case MSG_JOIN_ACK:      on_join_ack((const JoinAckMsg *)rbuf);         break;
-        case MSG_GAME_START:    on_game_start((const GameStartMsg *)rbuf);     break;
-        case MSG_ROUND_START:   on_round_start((const RoundStartMsg *)rbuf);   break;
-        case MSG_TIMER_TICK:    on_timer_tick((const TimerTickMsg *)rbuf);      break;
-        case MSG_ROUND_EVENT:   on_round_event((const RoundEventMsg *)rbuf);   break;
-        case MSG_PLAYER_ELIM:   on_player_elim((const PlayerElimMsg *)rbuf);   break;
-        case MSG_GAME_OVER:     on_game_over((const GameOverMsg *)rbuf);       break;
-        case MSG_ERROR:         on_error((const ErrorMsg *)rbuf);              break;
-        case MSG_WAIT:          on_wait();                                     break;
-        case MSG_CHAR_LIST:     on_char_list((const CharListMsg *)rbuf);       break;
-        case MSG_STATUS_UPDATE: on_status_update((const StatusUpdateMsg *)rbuf); break;
+        case MSG_LOBBY_UPDATE:   on_lobby_update((const LobbyUpdateMsg *)rbuf);     break;
+        case MSG_JOIN_ACK:       on_join_ack((const JoinAckMsg *)rbuf);             break;
+        case MSG_GAME_START:     on_game_start((const GameStartMsg *)rbuf);         break;
+        case MSG_ROUND_START:    on_round_start((const RoundStartMsg *)rbuf);       break;
+        case MSG_TIMER_TICK:     on_timer_tick((const TimerTickMsg *)rbuf);         break;
+        case MSG_ROUND_EVENT:    on_round_event((const RoundEventMsg *)rbuf);       break;
+        case MSG_PLAYER_ELIM:    on_player_elim((const PlayerElimMsg *)rbuf);       break;
+        case MSG_GAME_OVER:      on_game_over((const GameOverMsg *)rbuf);           break;
+        case MSG_ERROR:          on_error((const ErrorMsg *)rbuf);                  break;
+        case MSG_WAIT:           on_wait();                                         break;
+        case MSG_CHAR_LIST:      on_char_list((const CharListMsg *)rbuf);           break;
+        case MSG_STATUS_UPDATE:  on_status_update((const StatusUpdateMsg *)rbuf);   break;
+        case MSG_ROOM_LIST:      on_room_list((const RoomListMsg *)rbuf);           break;
+        case MSG_SPECTATE_START: on_spectate_start((const SpectateStartMsg *)rbuf); break;
         }
 
         int rem = rbuf_len - (int)needed;
@@ -410,9 +497,49 @@ static void handle_stdin_lobby(int sockfd)
     fflush(stdout);
 }
 
+static void handle_stdin_room_select(int sockfd)
+{
+    char line[128];
+    if (fgets(line, sizeof(line), stdin) == NULL) {
+        printf("EOF on stdin.\n");
+        close(sockfd);
+        exit(0);
+    }
+    line[strcspn(line, "\n")] = '\0';
+
+    JoinRoomMsg msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = MSG_JOIN_ROOM;
+    strncpy(msg.name, my_name, PLAYER_NAME_LEN - 1);
+
+    if (strcmp(line, "new") == 0) {
+        msg.room_id = AUTO_ROOM;
+        if (write_all(sockfd, &msg, sizeof(msg)) < 0) {
+            perror("write"); exit(1);
+        }
+        return;
+    }
+
+    int room_id = -1;
+    if (sscanf(line, "join %d", &room_id) == 1 && room_id >= 0) {
+        msg.room_id = (uint8_t)room_id;
+        if (write_all(sockfd, &msg, sizeof(msg)) < 0) {
+            perror("write"); exit(1);
+        }
+        return;
+    }
+
+    printf("Commands: 'join <room_id>' to join a room, 'new' for an empty room\n> ");
+    fflush(stdout);
+}
+
 static void handle_stdin_game(int sockfd)
 {
     char line[128];
+
+    // Clear the current line to allow user input
+    printf("\r\033[K");
+
     if (fgets(line, sizeof(line), stdin) == NULL) {
         printf("EOF on stdin, disconnecting.\n");
         close(sockfd);
@@ -420,13 +547,21 @@ static void handle_stdin_game(int sockfd)
     }
     line[strcspn(line, "\n")] = '\0';
 
+    // Manual exit if the player types quit
+    if (strcmp(line, "quit") == 0) {
+    	printf("Exiting game...\n");
+	close(sockfd);
+	exit(0);
+    }
+
     if (my_id < 0) return;
 
     int aid = -1, tid = NO_TARGET;
     int parsed = sscanf(line, "%d %d", &aid, &tid);
 
     if (parsed < 1 || aid < 0 || aid >= action_count) {
-        printf("Enter action number (0-%d), optionally followed by target player ID.\n",
+	// Print a newline for error to prevent blocking the timer
+        printf("\nInvalid input. Enter action number (0-%d), optionally followed by target player ID.\n",
                action_count - 1);
         prompt_action(sockfd);
         return;
@@ -463,16 +598,15 @@ int main(int argc, char *argv[])
     if (argc >= 2) host = argv[1];
     if (argc >= 3) port = atoi(argv[2]);
 
-    /* Get player name */
-    char name[PLAYER_NAME_LEN];
+    /* Get player name (stored; sent later with MSG_JOIN_ROOM) */
     printf("Enter your name: ");
     fflush(stdout);
-    if (fgets(name, sizeof(name), stdin) == NULL) {
+    if (fgets(my_name, sizeof(my_name), stdin) == NULL) {
         fprintf(stderr, "No name provided.\n");
         return 1;
     }
-    name[strcspn(name, "\n")] = '\0';
-    if (name[0] == '\0') {
+    my_name[strcspn(my_name, "\n")] = '\0';
+    if (my_name[0] == '\0') {
         fprintf(stderr, "Name cannot be empty.\n");
         return 1;
     }
@@ -495,16 +629,8 @@ int main(int argc, char *argv[])
         return 1;
     }
     printf("Connected to %s:%d\n", host, port);
-
-    /* Send join message */
-    JoinMsg jm;
-    memset(&jm, 0, sizeof(jm));
-    jm.msg_type = MSG_JOIN;
-    strncpy(jm.name, name, PLAYER_NAME_LEN - 1);
-    if (write_all(sockfd, &jm, sizeof(jm)) < 0) {
-        perror("write");
-        return 1;
-    }
+    printf("Waiting for room list...\n");
+    /* Room list arrives via MSG_ROOM_LIST; user will pick a room from there */
 
     /* Event loop */
     for (;;) {
@@ -535,8 +661,14 @@ int main(int argc, char *argv[])
 
         /* Read from stdin */
         if (FD_ISSET(STDIN_FILENO, &rfds)) {
-            if (my_id >= 0 && !waiting_for_result && !game_over
-                && !in_resolution) {
+            if (in_room_select) {
+                handle_stdin_room_select(sockfd);
+            } else if (is_spectator) {
+                /* Spectators can't interact; drain stdin */
+                char tmp[128];
+                if (fgets(tmp, sizeof(tmp), stdin) == NULL) break;
+            } else if (my_id >= 0 && !waiting_for_result && !game_over
+                       && !in_resolution) {
                 handle_stdin_game(sockfd);
                 need_prompt = 0;
             } else if (my_id < 0 && !game_over) {

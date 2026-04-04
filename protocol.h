@@ -18,6 +18,8 @@
 #define ROUND_TIMER_SECS 30
 #define NO_TARGET        0xFF
 #define NO_CHARACTER     0xFF
+#define ROOM_LIST_MAX    64   /* max rooms in MSG_ROOM_LIST */
+#define AUTO_ROOM        0xFF /* room_id meaning "auto-assign empty room" */
 
 /* =========================================================================
  * Character types
@@ -45,6 +47,7 @@ typedef enum {
     MSG_ACTION        = 0x02,
     MSG_START_GAME    = 0x03,
     MSG_CHAR_SELECT   = 0x04,
+    MSG_JOIN_ROOM     = 0x05,   /* Join/create a room (sent before entering lobby) */
 
     /* Server -> Client */
     MSG_LOBBY_UPDATE  = 0x10,
@@ -59,6 +62,8 @@ typedef enum {
     MSG_JOIN_ACK      = 0x19,
     MSG_CHAR_LIST     = 0x1A,   /* Available characters for selection */
     MSG_STATUS_UPDATE = 0x1B,   /* Per-player status effects text */
+    MSG_ROOM_LIST     = 0x1C,   /* Room selection screen on first connect */
+    MSG_SPECTATE_START = 0x1D,  /* Client joined a room mid-game as spectator */
 } MsgType;
 
 /* =========================================================================
@@ -196,7 +201,7 @@ typedef struct {
     uint8_t msg_type;           /* MSG_JOIN_ACK */
     uint8_t your_id;
     uint8_t is_host;
-    uint8_t padding;
+    uint8_t room_id;
 } JoinAckMsg;
 
 typedef struct {
@@ -211,5 +216,39 @@ typedef struct {
     uint8_t padding[3];
     char    text[STATUS_TEXT_LEN];
 } StatusUpdateMsg;
+
+/* =========================================================================
+ * Room list messages (new room-selection flow)
+ * ========================================================================= */
+
+/* One entry in the room list */
+typedef struct {
+    uint8_t room_id;
+    uint8_t player_count;
+    uint8_t phase;           /* 0 = lobby, non-zero = game in progress */
+    uint8_t spectator_count;
+} RoomInfo;
+
+typedef struct {
+    uint8_t  msg_type;       /* MSG_JOIN_ROOM */
+    uint8_t  room_id;        /* AUTO_ROOM (0xFF) = auto-assign to an empty room */
+    uint8_t  padding[2];
+    char     name[PLAYER_NAME_LEN];
+} JoinRoomMsg;
+
+typedef struct {
+    uint8_t  msg_type;       /* MSG_ROOM_LIST */
+    uint8_t  room_count;
+    uint8_t  padding[2];
+    RoomInfo rooms[ROOM_LIST_MAX];
+} RoomListMsg;
+
+typedef struct {
+    uint8_t    msg_type;     /* MSG_SPECTATE_START */
+    uint8_t    player_count;
+    uint8_t    round_num;
+    uint8_t    padding;
+    PlayerInfo players[MAX_PLAYERS];
+} SpectateStartMsg;
 
 #endif /* PROTOCOL_H */

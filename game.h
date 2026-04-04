@@ -3,7 +3,8 @@
 
 #include "protocol.h"
 
-#define MAX_EVENTS 16
+#define MAX_EVENTS      16
+#define MAX_SPECTATORS  16
 
 /* =========================================================================
  * Game phases
@@ -127,7 +128,24 @@ typedef struct {
     /* Read buffer for partial message reassembly */
     uint8_t  rbuf[256];
     int      rbuf_len;
+
+    /* Write buffer for non-blocking output */
+    uint8_t  wbuf[8192];
+    int      wbuf_len;
 } Player;
+
+/* =========================================================================
+ * Spectator (watching a game in progress, will join lobby when it ends)
+ * ========================================================================= */
+
+typedef struct {
+    int     fd;
+    char    name[PLAYER_NAME_LEN];
+    uint8_t rbuf[256];
+    int     rbuf_len;
+    uint8_t wbuf[8192];
+    int     wbuf_len;
+} Spectator;
 
 /* =========================================================================
  * Global game state
@@ -141,6 +159,7 @@ typedef struct {
     int       round_num;
     int       timer_secs_left;
     int       host_id;
+    int       room_idx;              /* index into server's rooms[] array */
 
     /* Character selection tracking */
     uint8_t   char_taken[NUM_CHARACTERS];
@@ -149,6 +168,10 @@ typedef struct {
     char      resolve_events[MAX_EVENTS][EVENT_TEXT_LEN];
     int       resolve_event_count;
     int       resolve_event_current;
+
+    /* Spectators watching a game in progress */
+    Spectator spectators[MAX_SPECTATORS];
+    int       spectator_count;
 } GameState;
 
 /* =========================================================================
